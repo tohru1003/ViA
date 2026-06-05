@@ -818,6 +818,22 @@ def get_us_financials(ticker, force_refresh=False):
             "ocf": ocf_l, "fcf": fcf_l,
             "roe": roe_l, "roa": roa_l, "de": de_l, "roic": roic_l,
         }
+        # EPS通貨ミスマッチ検出・USD換算
+        try:
+            import yfinance as _yf3
+            _tk3 = _yf3.Ticker(code)
+            _ttm = _tk3.info.get("trailingEps")
+            _price3 = _tk3.fast_info.last_price
+            if _ttm and _ttm > 0 and _price3 and _price3 > 0 and result["eps"]:
+                _latest = [v for v in result["eps"] if v is not None]
+                if _latest and (_price3 / _latest[-1] < 1.0 or _price3 / _latest[-1] > 500):
+                    _fi3 = _tk3.income_stmt
+                    _loc = _gs(_fi3, ["Basic EPS","Diluted EPS","EPS"]) if _fi3 is not None and not _fi3.empty else []
+                    if _loc and _loc[-1]:
+                        _fx = _ttm / _loc[-1]
+                        result["eps"] = [round(e*_fx,4) for e in _loc if e is not None]
+        except Exception:
+            pass
         # ファイルキャッシュに保存
         _save_cache(code, result, "eodhd")
         _eodhd_cache[code] = result
@@ -1320,6 +1336,7 @@ def process_ticker(ticker, market):
                 relaxed_items = [k for k in s_res if s_res[k] is False and r_res.get(k) is True]
 
                 dcf = calc_dcf(eps) if eps else None
+                print(f"DEBUG2: {ticker} eps[-3:]={eps[-3:] if eps else []} dcf={dcf is not None}")
                 if dcf and price and price > 0:
                     cur_eps_v = [v for v in eps if v is not None and not np.isnan(float(v))]
                     if cur_eps_v and cur_eps_v[-1] > 0:
@@ -1329,7 +1346,30 @@ def process_ticker(ticker, market):
                 if dcf and price and price > 0:
                     bp_check = dcf["dcf_buy_price"]
                     ratio = bp_check / price
-                    if ratio < 0.15 or ratio > 3.5:
+                if ratio > 3.5:
+                        print(f"DEBUG: {ticker} 比率={ratio:.2f} 換算処理開始")
+                        try:
+                            tk_yf = yf.Ticker(ticker)
+                            eps_ttm = tk_yf.info.get("trailingEps")
+                            if eps_ttm and eps_ttm > 0:
+                                fi_yf = tk_yf.income_stmt
+                                eps_local = _gs(fi_yf, ["Basic EPS","Diluted EPS","EPS"]) if fi_yf is not None and not fi_yf.empty else []
+                                if eps_local and eps_local[-1] and eps_local[-1] != 0:
+                                    fx = eps_ttm / eps_local[-1]
+                                    eps_usd = [round(e * fx, 4) for e in eps_local if e is not None]
+                                    dcf = calc_dcf(eps_usd)
+                                    if dcf and price > 0:
+                                        ratio2 = dcf["dcf_buy_price"] / price
+                                        if ratio2 < 0.15 or ratio2 > 3.5:
+                                            dcf = None
+                                else:
+                                    dcf = None
+                            else:
+                                dcf = None
+                        except Exception as _e:
+                            print(f"換算エラー({ticker}): {_e}")
+                            dcf = None
+                elif ratio < 0.15:
                         dcf = None
 
                 bp = dcf["dcf_buy_price"] if dcf else None
@@ -1367,7 +1407,9 @@ def process_ticker(ticker, market):
 
         # ── 米国株: EODHDを使用 ──
         if market == "US" and EODHD_TOKEN:
+            print(f"DEBUG0: {ticker} EODHD処理開始")
             eo = get_us_financials(ticker)
+            print(f"DEBUG1: {ticker} eps={eo.get('eps',[])[-3:]} roe={eo.get('roe',[])[-2:]}")
             if any(eo.get(k) for k in ["eps","ni","roe"]):
                 eps      = eo["eps"]
                 gm_arr   = eo["gm"]
@@ -1410,7 +1452,33 @@ def process_ticker(ticker, market):
                         if pe < 0.1 or pe > 300: dcf = None
                 if dcf and price and price > 0:
                     ratio = dcf["dcf_buy_price"] / price
-                    if ratio < 0.15 or ratio > 3.5: dcf = None
+                    if ratio > 3.5:
+                        # EPS通貨ミスマッチ → yfinanceのtrailingEpsで換算レートを推定
+                        try:
+                            tk_yf = yf.Ticker(ticker)
+                            eps_ttm = tk_yf.info.get("trailingEps")
+                            if eps_ttm and eps_ttm > 0:
+                                fi_yf = tk_yf.income_stmt
+                                eps_local = _gs(fi_yf, ["Basic EPS","Diluted EPS","EPS"]) \
+                                            if fi_yf is not None and not fi_yf.empty else []
+                                if eps_local and eps_local[-1] and eps_local[-1] != 0:
+                                    # 換算レート = trailingEps(USD) / 最新income_stmt EPS(現地通貨)
+                                    fx = eps_ttm / eps_local[-1]
+                                    # 過去のEPSもUSD換算
+                                    eps_usd = [round(e * fx, 4) for e in eps_local if e is not None]
+                                    dcf = calc_dcf(eps_usd)
+                                    if dcf and price > 0:
+                                        ratio2 = dcf["dcf_buy_price"] / price
+                                        if ratio2 < 0.15 or ratio2 > 3.5:
+                                            dcf = None
+                                else:
+                                    dcf = None
+                            else:
+                                dcf = None
+                        except Exception:
+                            dcf = None
+                    elif ratio < 0.15:
+                        dcf = None
 
                 bp = dcf["dcf_buy_price"] if dcf else None
                 uv = (price < bp) if bp and price and price > 0 else None
