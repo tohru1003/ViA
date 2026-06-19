@@ -776,7 +776,8 @@ def get_us_financials(ticker, force_refresh=False):
         ta_l  = [to_f(bs[y].get("totalAssets"))            for y in bs_years]
         td_l  = [to_f(bs[y].get("shortLongTermDebt")
                        or bs[y].get("longTermDebt"))        for y in bs_years]
-        ic_l  = [to_f(bs[y].get("investedCapital")
+        ic_l  = [to_f(bs[y].get("netInvestedCapital")
+                       or bs[y].get("investedCapital")
                        or bs[y].get("totalCapitalization")) for y in bs_years]
 
         # ── キャッシュフロー ──
