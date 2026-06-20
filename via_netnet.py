@@ -19,7 +19,7 @@ VIA ネットネット株スクリーナー（グレアム流）
 所要時間: 全銘柄(約4000社)で約60〜90分（yfinance呼び出しのため）
 """
 
-import sys, os, time, warnings
+import sys, os, time, json, warnings
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -31,6 +31,7 @@ SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR   = os.path.join(SCRIPT_DIR, "via_cache")
 OUTPUT_CSV  = os.path.join(SCRIPT_DIR, "via_netnet_results.csv")
 OUTPUT_HTML = os.path.join(SCRIPT_DIR, "via_netnet_results.html")
+MOAT_FILE   = os.path.join(SCRIPT_DIR, "via_moat.json")
 
 SLEEP_SEC        = 0.4
 NCAV_MARGIN      = 2/3   # グレアムの安全域基準（時価総額がNCAVの2/3以下）
@@ -249,9 +250,54 @@ def get_netnet_data(ticker):
         return None
 
 
+# ── モート関連 ──
+
+def load_moat_data():
+    if os.path.exists(MOAT_FILE):
+        try:
+            with open(MOAT_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _moat_cell(ticker, moat_db):
+    info = moat_db.get(ticker, {})
+    if not info:
+        return '<td class="n">—</td>'
+    grade   = info.get("moat_grade", "none")
+    bonus   = info.get("bonus", 0)
+    types   = info.get("moat_type", [])
+    comment = str(info.get("comment", "")).replace('"', "'")
+    risk    = str(info.get("risk", "")).replace('"', "'")
+
+    if grade == "wide":   bg, fg, label = "#1D3557", "#fff", "◎Wide"
+    elif grade == "narrow": bg, fg, label = "#457B9D", "#fff", "○Narrow"
+    else:                   bg, fg, label = "#e0e0e0", "#888", "△None"
+
+    try:
+        b = float(bonus)
+    except Exception:
+        b = 0
+    if b >= 25:   stars = "★★★★★"
+    elif b >= 15: stars = "★★★★"
+    elif b >= 8:  stars = "★★★"
+    elif b >= 1:  stars = "★★"
+    else:         stars = ""
+    star_disp = f" {stars}" if stars else ""
+
+    types_str = " ".join(f"[{t}]" for t in (types if isinstance(types, list) else []))
+    tooltip = f"{types_str} | {comment} | リスク:{risk}"[:200]
+
+    return (f'<td style="background:{bg};color:{fg};text-align:center;font-size:11px;'
+            f'font-weight:600;white-space:nowrap;cursor:help" title="{tooltip}">'
+            f'{label}{star_disp}</td>')
+
+
 # ── HTML生成 ──
 
-def make_html(rows, total_input, generated):
+def make_html(rows, total_input, generated, moat_db=None):
+    if moat_db is None: moat_db = {}
     netnet = [r for r in rows if r.get("is_netnet")]
     netnet_ocf = [r for r in netnet if r.get("ocf_positive")]
     netnet_3y  = [r for r in netnet if r.get("ocf_3y_all_positive")]
@@ -300,6 +346,8 @@ def make_html(rows, total_input, generated):
                      else '<span class="rev-ok">→維持</span>' if rev_decl is False
                      else '<span class="rev-na">—</span>')
 
+        moat_td = _moat_cell(r["ticker"], moat_db)
+
         trs.append(
             f'<tr>'
             f'<td><b>{r["ticker"]}</b></td>'
@@ -310,6 +358,7 @@ def make_html(rows, total_input, generated):
             f'<td class="num">{fmt_money(r["ncav"])}</td>'
             f'<td class="num ratio">{r.get("ncav_ratio","—")}</td>'
             f'<td class="num">{r.get("margin_pct","—")}%</td>'
+            f'{moat_td}'
             f'<td data-sort="{ocf_sort}">{ocf_badge}</td>'
             f'<td data-sort="{cf3y_sort}" title="直近3期: {r.get("ocf_3y_values")}">{cf3y_badge}</td>'
             f'<td data-sort="{trap_sort}" title="配当:{div_mark} 自社株買い:{bb_mark}">{trap_badge}</td>'
@@ -350,6 +399,7 @@ td.ratio{{font-weight:700;color:#0F6E56}}
 .rev-ok{{color:#0F6E56}}
 .rev-bad{{color:#993C1D;font-weight:700}}
 .rev-na{{color:#aaa}}
+.n{{color:#aaa;text-align:center}}
 </style></head><body>
 <h1>VIA ネットネット株スクリーニング（グレアム流） <a href="via_results.html" style="font-size:13px;font-weight:500;color:#185FA5;margin-left:12px;text-decoration:none;border:1px solid #185FA5;border-radius:6px;padding:3px 10px;vertical-align:middle">📈 通常のVIAスクリーニングはこちら</a></h1>
 <p class="meta">生成: {generated} ／ 対象: {total_input}銘柄（日本株）</p>
@@ -374,8 +424,9 @@ td.ratio{{font-weight:700;color:#0F6E56}}
   <th onclick="sortTable(2)">セクター</th><th onclick="sortTable(3)">株価</th>
   <th onclick="sortTable(4)">時価総額</th><th onclick="sortTable(5)">NCAV</th>
   <th onclick="sortTable(6)">時価総額/NCAV</th><th onclick="sortTable(7)">安全域余地</th>
-  <th onclick="sortTable(8)">営業CF</th><th onclick="sortTable(9)">3期CF</th>
-  <th onclick="sortTable(10)">株主還元</th><th onclick="sortTable(11)">売上trend</th>
+  <th onclick="sortTable(8)">モート</th>
+  <th onclick="sortTable(9)">営業CF</th><th onclick="sortTable(10)">3期CF</th>
+  <th onclick="sortTable(11)">株主還元</th><th onclick="sortTable(12)">売上trend</th>
 </tr></thead>
 <tbody>{"".join(trs)}</tbody>
 </table>
@@ -455,8 +506,11 @@ def main():
     df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
     print(f"\nCSV出力: {OUTPUT_CSV}")
 
+    moat_db = load_moat_data()
+    print(f"モートデータ読み込み: {len(moat_db)}銘柄")
+
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
-    html = make_html(rows, total, generated)
+    html = make_html(rows, total, generated, moat_db)
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"HTML出力: {OUTPUT_HTML}")
