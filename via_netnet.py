@@ -203,6 +203,7 @@ def make_html(rows, total_input, generated):
     for r in sorted(rows, key=lambda x: (x.get("ncav_ratio") if x.get("ncav_ratio") is not None else 999)):
         if not r.get("is_netnet"):
             continue
+        ocf_sort  = "1" if r.get("ocf_positive") else "0"
         ocf_badge = ('<span class="ocf-ok">CF+</span>' if r.get("ocf_positive")
                      else '<span class="ocf-bad">CF-</span>')
         trs.append(
@@ -218,7 +219,7 @@ def make_html(rows, total_input, generated):
             f'<td class="num">{r.get("ncav_per_share","—")}</td>'
             f'<td class="num ratio">{r.get("ncav_ratio","—")}</td>'
             f'<td class="num">{r.get("margin_pct","—")}%</td>'
-            f'<td>{ocf_badge}</td>'
+            f'<td data-sort="{ocf_sort}">{ocf_badge}</td>'
             f'</tr>'
         )
 
@@ -256,14 +257,34 @@ td.ratio{{font-weight:700;color:#0F6E56}}
   <div class="sc"><div class="sv" style="color:#185FA5">{len(netnet)}</div><div class="sl">ネットネット株</div></div>
   <div class="sc"><div class="sv" style="color:#0F6E56">{len(netnet_ocf)}</div><div class="sl">うち営業CF黒字</div></div>
 </div>
-<table>
+<table id="tbl">
 <thead><tr>
-  <th>Ticker</th><th>名称</th><th>セクター</th><th>株価</th>
-  <th>時価総額</th><th>流動資産</th><th>負債総額</th><th>NCAV</th>
-  <th>NCAV/株</th><th>時価総額/NCAV</th><th>安全域余地</th><th>営業CF</th>
+  <th onclick="sortTable(0)">Ticker</th><th onclick="sortTable(1)">名称</th>
+  <th onclick="sortTable(2)">セクター</th><th onclick="sortTable(3)">株価</th>
+  <th onclick="sortTable(4)">時価総額</th><th onclick="sortTable(5)">流動資産</th>
+  <th onclick="sortTable(6)">負債総額</th><th onclick="sortTable(7)">NCAV</th>
+  <th onclick="sortTable(8)">NCAV/株</th><th onclick="sortTable(9)">時価総額/NCAV</th>
+  <th onclick="sortTable(10)">安全域余地</th><th onclick="sortTable(11)">営業CF</th>
 </tr></thead>
 <tbody>{"".join(trs)}</tbody>
 </table>
+<script>
+var sd = {{}};
+function sortTable(c) {{
+  var tb = document.querySelector('#tbl tbody');
+  var rows = Array.from(tb.rows);
+  sd[c] = !sd[c];
+  rows.sort(function(a, b) {{
+    var av = a.cells[c] ? (a.cells[c].getAttribute('data-sort') || a.cells[c].textContent.trim()) : '';
+    var bv = b.cells[c] ? (b.cells[c].getAttribute('data-sort') || b.cells[c].textContent.trim()) : '';
+    var an = parseFloat(av.replace(/[^0-9.-]/g, ''));
+    var bn = parseFloat(bv.replace(/[^0-9.-]/g, ''));
+    if (!isNaN(an) && !isNaN(bn)) return sd[c] ? an - bn : bn - an;
+    return sd[c] ? av.localeCompare(bv) : bv.localeCompare(av);
+  }});
+  rows.forEach(function(r) {{ tb.appendChild(r); }});
+}}
+</script>
 </body></html>"""
 
 
