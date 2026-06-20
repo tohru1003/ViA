@@ -245,7 +245,7 @@ td.ratio{{font-weight:700;color:#0F6E56}}
 .ocf-ok{{color:#0F6E56;font-weight:700}}
 .ocf-bad{{color:#993C1D}}
 </style></head><body>
-<h1>VIA ネットネット株スクリーニング（グレアム流）</h1>
+<h1>VIA ネットネット株スクリーニング（グレアム流） <a href="via_results.html" style="font-size:13px;font-weight:500;color:#185FA5;margin-left:12px;text-decoration:none;border:1px solid #185FA5;border-radius:6px;padding:3px 10px;vertical-align:middle">📈 通常のVIAスクリーニングはこちら</a></h1>
 <p class="meta">生成: {generated} ／ 対象: {total_input}銘柄（日本株）</p>
 <div class="cfg">
   <b>判定基準</b>: NCAV（流動資産−負債総額）を計算し、時価総額がNCAVの2/3以下の銘柄を抽出。
