@@ -132,6 +132,13 @@ def get_netnet_data(ticker):
         total_liab      = _latest(bs, ["Total Liabilities Net Minority Interest",
                                         "Total Liab"])
 
+        # 投資有価証券（長期保有の金融資産）。グレアムの保守的NCAVには含まれないが、
+        # 換金性が高いため拡張指標（NCAV-Plus）の参考値として別枠で表示する。
+        investments = _latest(bs, ["Investmentin Financial Assets",
+                                     "Long Term Equity Investment",
+                                     "Investments And Advances"])
+        investments = investments or 0.0
+
         ocf_series = _series(cf, ["Operating Cash Flow",
                                    "Cash Flow From Continuing Operating Activities"])
         ocf = ocf_series[0] if ocf_series else None
@@ -140,6 +147,7 @@ def get_netnet_data(ticker):
             return None
 
         ncav = current_assets - total_liab
+        ncav_plus = ncav + investments  # 投資有価証券を加算した拡張NCAV
 
         # 株価・市場規模
         price = None
@@ -170,11 +178,17 @@ def get_netnet_data(ticker):
 
         ncav_per_share = ncav / shares if shares else None
 
-        # 判定
+        # 判定（通常NCAV：グレアムの保守的基準）
         ncav_positive = ncav > 0
         below_2_3 = (market_cap <= ncav * NCAV_MARGIN) if ncav_positive else False
         ocf_positive = (ocf is not None and ocf >= 0)
         is_netnet = ncav_positive and below_2_3
+
+        # 判定（NCAV-Plus：投資有価証券を加えた拡張基準）
+        ncav_plus_positive = ncav_plus > 0
+        below_2_3_plus = (market_cap <= ncav_plus * NCAV_MARGIN) if ncav_plus_positive else False
+        is_netnet_plus = ncav_plus_positive and below_2_3_plus and not is_netnet
+        # is_netnet_plus: 通常NCAVでは対象外だが、投資有価証券を加えると対象になる銘柄
 
         # ── ① 過去3期営業CFの一貫性チェック ──
         ocf_3y = ocf_series[:3]  # 直近3期（新しい順）
@@ -233,6 +247,13 @@ def get_netnet_data(ticker):
             "is_netnet": is_netnet,
             "margin_pct": round((ncav * NCAV_MARGIN - market_cap) / (ncav * NCAV_MARGIN) * 100, 1)
                           if ncav_positive and ncav * NCAV_MARGIN > 0 else None,
+            # NCAV-Plus（投資有価証券を加算した拡張指標）
+            "investments": round(investments, 0),
+            "ncav_plus": round(ncav_plus, 0),
+            "ncav_plus_ratio": round(market_cap / ncav_plus, 3) if ncav_plus_positive else None,
+            "is_netnet_plus": is_netnet_plus,
+            "margin_pct_plus": round((ncav_plus * NCAV_MARGIN - market_cap) / (ncav_plus * NCAV_MARGIN) * 100, 1)
+                          if ncav_plus_positive and ncav_plus * NCAV_MARGIN > 0 else None,
             # ① 営業CF一貫性
             "ocf_3y_all_positive": ocf_3y_all_positive,
             "ocf_3y_count_positive": ocf_3y_count_positive,
@@ -302,15 +323,15 @@ def make_html(rows, total_input, generated, moat_db=None):
     netnet_ocf = [r for r in netnet if r.get("ocf_positive")]
     netnet_3y  = [r for r in netnet if r.get("ocf_3y_all_positive")]
     netnet_safe = [r for r in netnet if r.get("ocf_3y_all_positive") and not r.get("value_trap_flag")]
+    netnet_plus = [r for r in rows if r.get("is_netnet_plus")]  # 投資有価証券加算で新たに対象になった銘柄
 
     def fmt_money(v):
         if v is None: return "—"
         return f"{v:,.0f}"
 
     trs = []
-    for r in sorted(rows, key=lambda x: (x.get("ncav_ratio") if x.get("ncav_ratio") is not None else 999)):
-        if not r.get("is_netnet"):
-            continue
+    display_rows = [r for r in rows if r.get("is_netnet") or r.get("is_netnet_plus")]
+    for r in sorted(display_rows, key=lambda x: (x.get("ncav_ratio") if x.get("ncav_ratio") is not None else 999)):
 
         ocf_badge = ('<span class="ocf-ok">CF+</span>' if r.get("ocf_positive")
                      else '<span class="ocf-bad">CF-</span>')
@@ -348,6 +369,17 @@ def make_html(rows, total_input, generated, moat_db=None):
 
         moat_td = _moat_cell(r["ticker"], moat_db)
 
+        if r.get("is_netnet"):
+            type_badge = '<span class="type-strict">NCAV</span>'
+            type_sort = "1"
+            ratio_disp = r.get("ncav_ratio", "—")
+            margin_disp = r.get("margin_pct", "—")
+        else:
+            type_badge = '<span class="type-plus">NCAV+有価証券</span>'
+            type_sort = "0"
+            ratio_disp = r.get("ncav_plus_ratio", "—")
+            margin_disp = r.get("margin_pct_plus", "—")
+
         trs.append(
             f'<tr>'
             f'<td><b>{r["ticker"]}</b></td>'
@@ -356,8 +388,10 @@ def make_html(rows, total_input, generated, moat_db=None):
             f'<td class="num">{r["price"]}</td>'
             f'<td class="num">{fmt_money(r["market_cap"])}</td>'
             f'<td class="num">{fmt_money(r["ncav"])}</td>'
-            f'<td class="num ratio">{r.get("ncav_ratio","—")}</td>'
-            f'<td class="num">{r.get("margin_pct","—")}%</td>'
+            f'<td class="num" title="投資有価証券: {fmt_money(r.get("investments",0))}">{fmt_money(r.get("ncav_plus", r["ncav"]))}</td>'
+            f'<td data-sort="{type_sort}">{type_badge}</td>'
+            f'<td class="num ratio">{ratio_disp}</td>'
+            f'<td class="num">{margin_disp}%</td>'
             f'{moat_td}'
             f'<td data-sort="{ocf_sort}">{ocf_badge}</td>'
             f'<td data-sort="{cf3y_sort}" title="直近3期: {r.get("ocf_3y_values")}">{cf3y_badge}</td>'
@@ -400,11 +434,15 @@ td.ratio{{font-weight:700;color:#0F6E56}}
 .rev-bad{{color:#993C1D;font-weight:700}}
 .rev-na{{color:#aaa}}
 .n{{color:#aaa;text-align:center}}
+.type-strict{{background:#e1f5ee;color:#0F6E56;border:1px solid #1D9E75;font-size:10px;padding:1px 6px;border-radius:8px;font-weight:600}}
+.type-plus{{background:#f0e9f7;color:#7B5EA7;border:1px solid #9B7EBE;font-size:10px;padding:1px 6px;border-radius:8px;font-weight:600;white-space:nowrap}}
 </style></head><body>
 <h1>VIA ネットネット株スクリーニング（グレアム流） <a href="via_results.html" style="font-size:13px;font-weight:500;color:#185FA5;margin-left:12px;text-decoration:none;border:1px solid #185FA5;border-radius:6px;padding:3px 10px;vertical-align:middle">📈 通常のVIAスクリーニングはこちら</a></h1>
 <p class="meta">生成: {generated} ／ 対象: {total_input}銘柄（日本株）</p>
 <div class="cfg">
-  <b>NCAV判定</b>: 流動資産−負債総額 を計算し、時価総額がNCAVの2/3以下の銘柄を抽出。
+  <b>NCAV判定</b>: 流動資産−負債総額 を計算し、時価総額がNCAVの2/3以下の銘柄を抽出（グレアムの保守的基準）。
+  <b>NCAV+有価証券</b>: 投資有価証券（長期保有の金融資産）を加算した拡張基準。通常NCAVでは対象外だが、
+  この拡張基準でのみ条件を満たす銘柄を「判定種別」列で区別して表示。賃貸等不動産は現時点未対応。
 </div>
 <div class="cfg2">
   <b>追加リスクチェック</b>:　
@@ -413,7 +451,8 @@ td.ratio{{font-weight:700;color:#0F6E56}}
   <b>売上trend</b>=直近3期の売上推移（事業の先細りシグナル）
 </div>
 <div class="summary">
-  <div class="sc"><div class="sv" style="color:#185FA5">{len(netnet)}</div><div class="sl">ネットネット株</div></div>
+  <div class="sc"><div class="sv" style="color:#185FA5">{len(netnet)}</div><div class="sl">ネットネット株（NCAV基準）</div></div>
+  <div class="sc"><div class="sv" style="color:#7B5EA7">{len(netnet_plus)}</div><div class="sl">NCAV+有価証券で追加対象</div></div>
   <div class="sc"><div class="sv" style="color:#0F6E56">{len(netnet_ocf)}</div><div class="sl">うち営業CF黒字</div></div>
   <div class="sc"><div class="sv" style="color:#0F6E56">{len(netnet_3y)}</div><div class="sl">うち3期連続CF黒字</div></div>
   <div class="sc"><div class="sv" style="color:#185FA5">{len(netnet_safe)}</div><div class="sl">3期黒字×株主還元あり</div></div>
@@ -423,10 +462,11 @@ td.ratio{{font-weight:700;color:#0F6E56}}
   <th onclick="sortTable(0)">Ticker</th><th onclick="sortTable(1)">名称</th>
   <th onclick="sortTable(2)">セクター</th><th onclick="sortTable(3)">株価</th>
   <th onclick="sortTable(4)">時価総額</th><th onclick="sortTable(5)">NCAV</th>
-  <th onclick="sortTable(6)">時価総額/NCAV</th><th onclick="sortTable(7)">安全域余地</th>
-  <th onclick="sortTable(8)">モート</th>
-  <th onclick="sortTable(9)">営業CF</th><th onclick="sortTable(10)">3期CF</th>
-  <th onclick="sortTable(11)">株主還元</th><th onclick="sortTable(12)">売上trend</th>
+  <th onclick="sortTable(6)">NCAV+有価証券</th><th onclick="sortTable(7)">判定種別</th>
+  <th onclick="sortTable(8)">時価総額/NCAV</th><th onclick="sortTable(9)">安全域余地</th>
+  <th onclick="sortTable(10)">モート</th>
+  <th onclick="sortTable(11)">営業CF</th><th onclick="sortTable(12)">3期CF</th>
+  <th onclick="sortTable(13)">株主還元</th><th onclick="sortTable(14)">売上trend</th>
 </tr></thead>
 <tbody>{"".join(trs)}</tbody>
 </table>
@@ -496,6 +536,8 @@ def main():
                 cf3_str = "3期黒字" if r.get("ocf_3y_all_positive") else f"{r.get('ocf_3y_count_positive',0)}/3期"
                 trap_str = "還元あり" if not r.get("value_trap_flag") else "還元なし"
                 print(f"-> NCAV比率:{r['ncav_ratio']}  {ocf_str}  {cf3_str}  {trap_str}  ★ネットネット")
+            elif r.get("is_netnet_plus"):
+                print(f"-> NCAV+有価証券比率:{r['ncav_plus_ratio']}  ★NCAV+対象（投資有価証券加算）")
             else:
                 print("-> 対象外")
         else:
