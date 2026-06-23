@@ -49,6 +49,35 @@ def calc_moat_score(row, moat_db):
     return {"moat_score": total, "moat_grade": grade,
             "moat_types": types, "moat_comment": comment, "moat_risk": risk}
 
+def _asset_cell(row):
+    ratio = row.get("asset_undervaluation_ratio")
+    if ratio is None or str(ratio) in ("", "nan", "None"):
+        return '<td class="n">—</td>'
+    try:
+        ratio_f = float(ratio)
+    except Exception:
+        return '<td class="n">—</td>'
+    is_uv = str(row.get("is_asset_undervalued","")).lower() == "true"
+    vd = row.get("valuation_diff")
+    rp = row.get("rental_property_gain")
+    parts = []
+    try:
+        vd_f = float(vd)
+        parts.append(f"評価差額金:{vd_f:,.0f}円")
+    except Exception:
+        pass
+    try:
+        rp_f = float(rp)
+        if rp_f and rp_f == rp_f:  # NaN チェック（NaN != NaN）
+            parts.append(f"賃貸不動産含み益:{rp_f:,.0f}円")
+    except Exception:
+        pass
+    tooltip = " | ".join(parts)
+    cls = "uv-yes" if is_uv else ""
+    star = " ★" if is_uv else ""
+    return f'<td class="{cls}" title="{tooltip}">資産{ratio_f:.2f}{star}</td>'
+
+
 def _moat_cell(moat):
     score = moat.get("moat_score", 0)
     grade = moat.get("moat_grade", "none")
@@ -233,7 +262,8 @@ def _score_color(s, t):
     if r >= 0.6: return "#BA7517"
     return "#E24B4A"
 
-def make_html(df_all, total_input, generated):
+def make_html(df_all, total_input, generated, moat_db=None):
+    if moat_db is None: moat_db = {}
     df = df_all[df_all["grade"].isin(["STRICT","RELAXED"])].copy()
 
     # ソート
@@ -312,6 +342,7 @@ def make_html(df_all, total_input, generated):
             f'<td class="num">{bp_disp}</td>'
             f'<td class="num">{itr or "—"}</td>'
             f'{uv_cell}'
+            f'{_asset_cell(row)}'
             f'{_moat_cell(moat)}'
             f'<td class="gr" data-rate="{raw_f}">{raw if raw and str(raw) not in ("","nan","None") else ""}</td>'
             f'<td class="num">{row.get("latest_EPS","")}</td>'
@@ -510,7 +541,7 @@ def main():
 
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
     total = len(df)
-    html = make_html(df, total, generated)
+    html = make_html(df, total, generated, MOAT_DATA)
 
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)

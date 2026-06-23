@@ -17,6 +17,11 @@ import numpy as np
 import os, time, warnings, urllib.request, ssl, sys
 from datetime import datetime
 
+try:
+    import via_edinet_module as _edinet
+except ImportError:
+    _edinet = None
+
 warnings.filterwarnings('ignore')
 
 # ── 設定 ──────────────────────────────────────────────
@@ -776,8 +781,7 @@ def get_us_financials(ticker, force_refresh=False):
         ta_l  = [to_f(bs[y].get("totalAssets"))            for y in bs_years]
         td_l  = [to_f(bs[y].get("shortLongTermDebt")
                        or bs[y].get("longTermDebt"))        for y in bs_years]
-        ic_l  = [to_f(bs[y].get("netInvestedCapital")
-                       or bs[y].get("investedCapital")
+        ic_l  = [to_f(bs[y].get("investedCapital")
                        or bs[y].get("totalCapitalization")) for y in bs_years]
 
         # ── キャッシュフロー ──
@@ -819,22 +823,28 @@ def get_us_financials(ticker, force_refresh=False):
             "ocf": ocf_l, "fcf": fcf_l,
             "roe": roe_l, "roa": roa_l, "de": de_l, "roic": roic_l,
         }
-        # EPS通貨ミスマッチ検出・USD換算
+        # ── EPS通貨ミスマッチ検出・USD換算 ──
+        # yfinanceのtrailingEpsと比較してEPSが現地通貨建ての場合は換算
         try:
             import yfinance as _yf3
             _tk3 = _yf3.Ticker(code)
             _ttm = _tk3.info.get("trailingEps")
             _price3 = _tk3.fast_info.last_price
             if _ttm and _ttm > 0 and _price3 and _price3 > 0 and result["eps"]:
-                _latest = [v for v in result["eps"] if v is not None]
-                if _latest and (_price3 / _latest[-1] < 1.0 or _price3 / _latest[-1] > 500):
-                    _fi3 = _tk3.income_stmt
-                    _loc = _gs(_fi3, ["Basic EPS","Diluted EPS","EPS"]) if _fi3 is not None and not _fi3.empty else []
-                    if _loc and _loc[-1]:
-                        _fx = _ttm / _loc[-1]
-                        result["eps"] = [round(e*_fx,4) for e in _loc if e is not None]
+                _latest_eps = [v for v in result["eps"] if v is not None]
+                if _latest_eps:
+                    _pe_eodhd = _price3 / _latest_eps[-1]
+                    # P/Eが異常に低い（<1）または高い（>500）場合は通貨ミスマッチ
+                    if _pe_eodhd < 1.0 or _pe_eodhd > 500:
+                        _fi3 = _tk3.income_stmt
+                        _eps_local = _gs(_fi3, ["Basic EPS","Diluted EPS","EPS"])                                      if _fi3 is not None and not _fi3.empty else []
+                        if _eps_local and _eps_local[-1] and _eps_local[-1] != 0:
+                            _fx = _ttm / _eps_local[-1]
+                            _eps_usd = [round(e * _fx, 4) for e in _eps_local if e is not None]
+                            result["eps"] = _eps_usd
         except Exception:
-            pass
+            pass  # 換算失敗時はEODHDのEPSをそのまま使用
+
         # ファイルキャッシュに保存
         _save_cache(code, result, "eodhd")
         _eodhd_cache[code] = result
@@ -1002,6 +1012,61 @@ def get_jp_financials(code4):
             return cached_jq
         _jq_cache[code4] = empty
         return empty
+
+
+def calc_asset_undervaluation(ticker, market, market_cap):
+    """
+    VIA通過銘柄（日本株）について、資産面の過小評価要因を計算する。
+    NCAV（流動資産-負債総額）+ 投資有価証券（時価）- 税効果額（評価差額金から逆算）
+    を時価総額と比較し、過小評価スコアを返す。
+
+    米国株、または_edinetモジュールが無い場合はNoneを返す（スキップ）。
+    """
+    if market != "JP" or _edinet is None or not market_cap:
+        return None
+    try:
+        tk = yf.Ticker(ticker)
+        bs = tk.balance_sheet
+        if bs is None or bs.empty:
+            return None
+
+        def _latest(keys):
+            for k in keys:
+                if k in bs.index:
+                    vals = bs.loc[k].dropna()
+                    if not vals.empty:
+                        return float(vals.iloc[0])
+            return None
+
+        current_assets = _latest(["Current Assets"])
+        total_liab      = _latest(["Total Liabilities Net Minority Interest", "Total Liab"])
+        investments     = _latest(["Investmentin Financial Assets",
+                                     "Long Term Equity Investment",
+                                     "Investments And Advances"]) or 0.0
+
+        if current_assets is None or total_liab is None:
+            return None
+
+        # 決算日ヒント取得（EDINET検索の高速化用）
+        fiscal_year_end = None
+        try:
+            info = tk.info
+            fy_end_ts = info.get("lastFiscalYearEnd")
+            if fy_end_ts:
+                fy_dt = datetime.fromtimestamp(fy_end_ts)
+                fiscal_year_end = fy_dt.strftime("%m-%d")
+        except Exception:
+            pass
+
+        mapping = _edinet.load_edinet_mapping()
+        result = _edinet.calc_asset_undervaluation_score(
+            ticker, market_cap, current_assets, total_liab,
+            investments=investments, mapping=mapping,
+            fiscal_year_end=fiscal_year_end,
+        )
+        return result
+    except Exception:
+        return None
 
 
 def get_tickers():
@@ -1337,7 +1402,6 @@ def process_ticker(ticker, market):
                 relaxed_items = [k for k in s_res if s_res[k] is False and r_res.get(k) is True]
 
                 dcf = calc_dcf(eps) if eps else None
-                print(f"DEBUG2: {ticker} eps[-3:]={eps[-3:] if eps else []} dcf={dcf is not None}")
                 if dcf and price and price > 0:
                     cur_eps_v = [v for v in eps if v is not None and not np.isnan(float(v))]
                     if cur_eps_v and cur_eps_v[-1] > 0:
@@ -1347,14 +1411,15 @@ def process_ticker(ticker, market):
                 if dcf and price and price > 0:
                     bp_check = dcf["dcf_buy_price"]
                     ratio = bp_check / price
-                if ratio > 3.5:
-                        print(f"DEBUG: {ticker} 比率={ratio:.2f} 換算処理開始")
+                    if ratio > 3.5:
+                        # EPS通貨ミスマッチ → yfinanceのtrailingEpsで換算レートを推定
                         try:
                             tk_yf = yf.Ticker(ticker)
                             eps_ttm = tk_yf.info.get("trailingEps")
                             if eps_ttm and eps_ttm > 0:
                                 fi_yf = tk_yf.income_stmt
-                                eps_local = _gs(fi_yf, ["Basic EPS","Diluted EPS","EPS"]) if fi_yf is not None and not fi_yf.empty else []
+                                eps_local = _gs(fi_yf, ["Basic EPS","Diluted EPS","EPS"]) \
+                                            if fi_yf is not None and not fi_yf.empty else []
                                 if eps_local and eps_local[-1] and eps_local[-1] != 0:
                                     fx = eps_ttm / eps_local[-1]
                                     eps_usd = [round(e * fx, 4) for e in eps_local if e is not None]
@@ -1367,10 +1432,10 @@ def process_ticker(ticker, market):
                                     dcf = None
                             else:
                                 dcf = None
-                        except Exception as _e:
-                            print(f"換算エラー({ticker}): {_e}")
+                        except Exception:
                             dcf = None
-                elif ratio < 0.15:
+                    elif ratio < 0.15:
+                        dcf = None
                         dcf = None
 
                 bp = dcf["dcf_buy_price"] if dcf else None
@@ -1408,9 +1473,7 @@ def process_ticker(ticker, market):
 
         # ── 米国株: EODHDを使用 ──
         if market == "US" and EODHD_TOKEN:
-            print(f"DEBUG0: {ticker} EODHD処理開始")
             eo = get_us_financials(ticker)
-            print(f"DEBUG1: {ticker} eps={eo.get('eps',[])[-3:]} roe={eo.get('roe',[])[-2:]}")
             if any(eo.get(k) for k in ["eps","ni","roe"]):
                 eps      = eo["eps"]
                 gm_arr   = eo["gm"]
@@ -1460,8 +1523,7 @@ def process_ticker(ticker, market):
                             eps_ttm = tk_yf.info.get("trailingEps")
                             if eps_ttm and eps_ttm > 0:
                                 fi_yf = tk_yf.income_stmt
-                                eps_local = _gs(fi_yf, ["Basic EPS","Diluted EPS","EPS"]) \
-                                            if fi_yf is not None and not fi_yf.empty else []
+                                eps_local = _gs(fi_yf, ["Basic EPS","Diluted EPS","EPS"])                                             if fi_yf is not None and not fi_yf.empty else []
                                 if eps_local and eps_local[-1] and eps_local[-1] != 0:
                                     # 換算レート = trailingEps(USD) / 最新income_stmt EPS(現地通貨)
                                     fx = eps_ttm / eps_local[-1]
@@ -1805,6 +1867,20 @@ def make_html(df_all, total_input, generated):
         score_disp = (f'{ss}/{st}'
                       + (f'<span class="r-score"> ({rs}/{rt})</span>'
                          if g=="RELAXED" else ""))
+        asset_ratio = row.get("asset_undervaluation_ratio")
+        is_asset_uv = row.get("is_asset_undervalued")
+        vd = row.get("valuation_diff")
+        rp_gain = row.get("rental_property_gain")
+        if pd.notna(asset_ratio) if hasattr(pd, "notna") else (asset_ratio is not None):
+            tooltip_parts = [f"評価差額金:{vd if vd else 0:,.0f}円"]
+            if rp_gain and (not pd.isna(rp_gain) if hasattr(pd,"isna") else True):
+                tooltip_parts.append(f"賃貸不動産含み益:{rp_gain:,.0f}円")
+            tooltip = " | ".join(tooltip_parts)
+            asset_cell = (f'<td class="uv-yes" title="{tooltip}">'
+                          f'資産{asset_ratio:.2f} {"★" if is_asset_uv else ""}</td>')
+        else:
+            asset_cell = '<td class="n">—</td>'
+
         rows.append(
             f'<tr data-grade="{g}" data-uv="{"1" if uv else "0"}">'
             f'<td>{row.get("market","")}</td>'
@@ -1817,6 +1893,7 @@ def make_html(df_all, total_input, generated):
             f'<td class="num">{(str(bp) + " ✓") if bp else ("— " + str(row.get("dcf_skip_reason",""))[:20] if row.get("dcf_skip_reason") else "—")}</td>'
             f'<td class="num">{itr or "—"}</td>'
             f'{uv_cell}'
+            f'{asset_cell}'
             f'{_moat_cell(row)}'
             f'<td class="gr" data-rate="{row.get("dcf_raw_rate") or 0}">{row.get("dcf_raw_rate","")}</td>'
             f'<td class="num">{row.get("latest_EPS","")}</td>'
@@ -1900,7 +1977,8 @@ td.uv-no{{color:#993C1D;font-size:11px}}
   <button class="btn"        id="btn-strict"     onclick="setFilter('strict')">厳格通過のみ</button>
   <button class="btn"        id="btn-relaxed"    onclick="setFilter('relaxed')">緩和のみ通過</button>
 </div>
-<p class="leg">✓厳格通過 ／ △緩和で通過（橙色） ／ ✗NG ／ スコア: 厳格スコア (緩和スコア) ／ 列ヘッダーで並び替え</p>
+<p class="leg">✓厳格通過 ／ △緩和で通過（橙色） ／ ✗NG ／ スコア: 厳格スコア (緩和スコア) ／ 列ヘッダーで並び替え
+／ <b>資産過小評価</b>=NCAV(流動資産-負債総額)+投資有価証券(時価)-税効果額を時価総額と比較した比率（日本株のみ、EDINET有報から評価差額金を取得。1.0未満で★が過小評価）</p>
 <div class="tbl-wrap"><table id="tbl">
 <thead><tr>
   <th onclick="sortTable(0)">市場</th><th onclick="sortTable(1)">Ticker</th>
@@ -1910,13 +1988,14 @@ td.uv-no{{color:#993C1D;font-size:11px}}
   <th onclick="sortTable(7)">購買ターゲット価格</th>
   <th onclick="sortTable(8)">正味現在価値</th>
   <th onclick="sortTable(9)">割安判定</th>
-  <th onclick="sortTable(10)">モート</th>
-  <th onclick="sortTable(11)">成長率%</th>
-  <th onclick="sortTable(11)">EPS</th>
-  <th onclick="sortTable(12)">ROE%</th>
-  <th onclick="sortTable(13)">ROA%</th>
-  <th onclick="sortTable(14)">ROIC%</th>
-  <th onclick="sortTable(15)">D/E%</th>
+  <th onclick="sortTable(10)">資産過小評価</th>
+  <th onclick="sortTable(11)">モート</th>
+  <th onclick="sortTable(12)">成長率%</th>
+  <th onclick="sortTable(12)">EPS</th>
+  <th onclick="sortTable(13)">ROE%</th>
+  <th onclick="sortTable(14)">ROA%</th>
+  <th onclick="sortTable(15)">ROIC%</th>
+  <th onclick="sortTable(16)">D/E%</th>
   {th}
 </tr></thead>
 <tbody>{"".join(rows)}</tbody>
@@ -2062,6 +2141,43 @@ def main():
     df_valid = df_valid.sort_values(
         ["_uo","_go","s_score","s_pct"], ascending=[True,True,False,False]
     ).drop(columns=["_go","_uo"])
+
+    # ── STEP2.5: VIA通過銘柄に資産過小評価スコアを付与（日本株のみ） ──
+    passed_mask = df_valid["grade"].isin(["STRICT", "RELAXED"])
+    passed_jp = df_valid[passed_mask & (df_valid["market"] == "JP")]
+    if _edinet is not None and not passed_jp.empty:
+        print(f"\n[資産過小評価スコア計算] 対象: {len(passed_jp)}銘柄（VIA通過の日本株）")
+        for idx, row in passed_jp.iterrows():
+            ticker = row["ticker"]
+            price  = row.get("price")
+            # 時価総額を概算（株価のみ取得済みのため、必要なら再取得）
+            try:
+                tk_tmp = yf.Ticker(ticker)
+                mcap = tk_tmp.fast_info.market_cap
+            except Exception:
+                mcap = None
+            print(f"  {ticker:<10}", end=" ", flush=True)
+            asset_result = calc_asset_undervaluation(ticker, row["market"], mcap)
+            if asset_result:
+                def _s(v):
+                    return str(v) if v is not None else None
+                df_valid.at[idx, "ncav"] = _s(asset_result.get("ncav"))
+                df_valid.at[idx, "ncav_plus_tax_adjusted"] = _s(asset_result.get("ncav_plus_tax_adjusted"))
+                df_valid.at[idx, "asset_undervaluation_ratio"] = _s(asset_result.get("undervaluation_ratio"))
+                df_valid.at[idx, "is_asset_undervalued"] = _s(asset_result.get("is_undervalued"))
+                vd_data = asset_result.get("valuation_diff_data") or {}
+                rp_data = asset_result.get("rental_property_data") or {}
+                df_valid.at[idx, "valuation_diff"] = _s(vd_data.get("valuation_diff"))
+                df_valid.at[idx, "rental_property_gain"] = _s(rp_data.get("unrealized_gain"))
+                df_valid.at[idx, "rental_property_book_value"] = _s(rp_data.get("book_value"))
+                df_valid.at[idx, "rental_property_fair_value"] = _s(rp_data.get("fair_value"))
+                ratio_disp = asset_result.get("undervaluation_ratio")
+                rp_str = f" 不動産含み益:{rp_data.get('unrealized_gain',0):,.0f}円" if rp_data.get("unrealized_gain") else ""
+                print(f"-> NCAV+調整後比率:{ratio_disp}{rp_str}  "
+                      f"{'★資産過小評価' if asset_result.get('is_undervalued') else ''}")
+            else:
+                print("-> データ取得不可")
+            time.sleep(0.5)
 
     df_valid.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
     print(f"\nCSV出力: {OUTPUT_CSV}")
