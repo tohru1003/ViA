@@ -1043,9 +1043,24 @@ def calc_asset_undervaluation(ticker, market, market_cap):
         investments     = _latest(["Investmentin Financial Assets",
                                      "Long Term Equity Investment",
                                      "Investments And Advances"]) or 0.0
+        # 非支配株主持分（連結子会社の少数株主分）。
+        # 親会社株主に帰属しない清算価値のため、NCAVから除外する。
+        minority_interest = _latest(["Minority Interest"]) or 0.0
 
         if current_assets is None or total_liab is None:
             return None
+
+        # 棚卸資産劣化リスク用データ（在庫・売上高の時系列）
+        inventory_series = None
+        revenue_series = None
+        try:
+            if "Inventory" in bs.index:
+                inventory_series = bs.loc["Inventory"].dropna().tolist()
+            fi = tk.income_stmt
+            if fi is not None and "Total Revenue" in fi.index:
+                revenue_series = fi.loc["Total Revenue"].dropna().tolist()
+        except Exception:
+            pass
 
         # 決算日ヒント取得（EDINET検索の高速化用）
         fiscal_year_end = None
@@ -1063,6 +1078,8 @@ def calc_asset_undervaluation(ticker, market, market_cap):
             ticker, market_cap, current_assets, total_liab,
             investments=investments, mapping=mapping,
             fiscal_year_end=fiscal_year_end,
+            inventory_series=inventory_series, revenue_series=revenue_series,
+            minority_interest=minority_interest,
         )
         return result
     except Exception:
@@ -2171,6 +2188,12 @@ def main():
                 df_valid.at[idx, "rental_property_gain"] = _s(rp_data.get("unrealized_gain"))
                 df_valid.at[idx, "rental_property_book_value"] = _s(rp_data.get("book_value"))
                 df_valid.at[idx, "rental_property_fair_value"] = _s(rp_data.get("fair_value"))
+                inv_risk = asset_result.get("inventory_risk_data") or {}
+                df_valid.at[idx, "inventory_growth_gap_pct"] = _s(inv_risk.get("growth_gap_pct"))
+                df_valid.at[idx, "is_inventory_risk"] = _s(inv_risk.get("is_inventory_risk"))
+                rb_data = asset_result.get("retirement_benefit_data") or {}
+                df_valid.at[idx, "retirement_unrealized_diff"] = _s(rb_data.get("unrealized_diff"))
+                df_valid.at[idx, "is_retirement_risk"] = _s(asset_result.get("is_retirement_risk"))
                 ratio_disp = asset_result.get("undervaluation_ratio")
                 rp_str = f" 不動産含み益:{rp_data.get('unrealized_gain',0):,.0f}円" if rp_data.get("unrealized_gain") else ""
                 print(f"-> NCAV+調整後比率:{ratio_disp}{rp_str}  "

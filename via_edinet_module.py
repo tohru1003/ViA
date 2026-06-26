@@ -187,6 +187,41 @@ def _parse_valuation_difference(content):
     return result if result else None
 
 
+def _parse_retirement_benefit_remeasurement(content):
+    """
+    XBRL生テキストから退職給付に係る未認識数理計算上の差異
+    （RemeasurementsOfDefinedBenefitPlans、連結・当期末・税効果後）を抽出する。
+
+    この金額はすでに連結BSの「退職給付に係る負債」に反映済みのため、
+    NCAVから追加で減算する対象ではない。将来の年金資産・負債の変動リスクを
+    示す警告指標として扱う。
+
+    戻り値: dict {remeasurement_after_tax, unrealized_diff, note} または None
+    """
+    pattern = r'<jppfs_cor:RemeasurementsOfDefinedBenefitPlans\s+([^>]*)>([^<]*)</jppfs_cor:RemeasurementsOfDefinedBenefitPlans>'
+    found_current = False
+    value = None
+    for attrs, v in re.findall(pattern, content):
+        ctx_match = re.search(r'contextRef="([^"]*)"', attrs)
+        ctx = ctx_match.group(1) if ctx_match else ""
+        if ctx == "CurrentYearInstant":
+            try:
+                value = float(v)
+                found_current = True
+            except Exception:
+                pass
+            break
+
+    if not found_current:
+        return None  # 退職給付制度の開示自体が無い、または当期分タグなし
+
+    unrealized_diff = value / (1 - EFFECTIVE_TAX_RATE) if value else 0
+    return {
+        "remeasurement_after_tax": round(value, 0),
+        "unrealized_diff": round(unrealized_diff, 0),
+    }
+
+
 # ── ② 賃貸等不動産の含み益の抽出 ──
 
 def _parse_jp_number(s):
@@ -288,8 +323,9 @@ def _get_xbrl_data(ticker, mapping=None, fiscal_year_end=None):
     """
     cached_vd = _load_cache(ticker, "_vd")
     cached_rp = _load_cache(ticker, "_rp")
-    if cached_vd is not None and cached_rp is not None:
-        return cached_vd, cached_rp
+    cached_rb = _load_cache(ticker, "_rb")
+    if cached_vd is not None and cached_rp is not None and cached_rb is not None:
+        return cached_vd, cached_rp, cached_rb
 
     if mapping is None:
         mapping = load_edinet_mapping()
@@ -297,18 +333,19 @@ def _get_xbrl_data(ticker, mapping=None, fiscal_year_end=None):
     code4 = ticker.replace(".T", "")
     edinet_code = mapping.get(code4)
     if not edinet_code:
-        return None, None
+        return None, None, None
 
     doc_id, period_end = _find_yuho_docid(edinet_code, fiscal_year_end=fiscal_year_end)
     if not doc_id:
-        return None, None
+        return None, None, None
 
     content = _fetch_xbrl_content(doc_id)
     if not content:
-        return None, None
+        return None, None, None
 
     vd_raw = _parse_valuation_difference(content)
     rp_raw = _parse_rental_property(content)
+    rb_raw = _parse_retirement_benefit_remeasurement(content)
 
     vd_result = None
     if vd_raw:
@@ -332,7 +369,14 @@ def _get_xbrl_data(ticker, mapping=None, fiscal_year_end=None):
         rp_result["period_end"] = period_end
     _save_cache(ticker, rp_result or {}, "_rp")
 
-    return vd_result, rp_result
+    rb_result = None
+    if rb_raw:
+        rb_result = dict(rb_raw)
+        rb_result["doc_id"] = doc_id
+        rb_result["period_end"] = period_end
+    _save_cache(ticker, rb_result or {}, "_rb")
+
+    return vd_result, rp_result, rb_result
 
 
 def get_valuation_difference(ticker, mapping=None, fiscal_year_end=None):
@@ -340,7 +384,7 @@ def get_valuation_difference(ticker, mapping=None, fiscal_year_end=None):
     その他有価証券評価差額金を取得する（後方互換のための単独関数）。
     内部的には_get_xbrl_dataを呼び、両方の項目を一度に取得・キャッシュする。
     """
-    vd, _ = _get_xbrl_data(ticker, mapping, fiscal_year_end)
+    vd, _, _ = _get_xbrl_data(ticker, mapping, fiscal_year_end)
     return vd if vd else None
 
 
@@ -349,12 +393,68 @@ def get_rental_property_gain(ticker, mapping=None, fiscal_year_end=None):
     賃貸等不動産の含み益を取得する。
     保有していない企業の場合はNoneを返す（過小評価判定では0として扱う）。
     """
-    _, rp = _get_xbrl_data(ticker, mapping, fiscal_year_end)
+    _, rp, _ = _get_xbrl_data(ticker, mapping, fiscal_year_end)
     return rp if rp else None
 
 
+def calc_inventory_risk(inventory_series, revenue_series):
+    """
+    棚卸資産の急増リスクを判定する（劣化リスクの代理指標）。
+    inventory_series, revenue_series: 新しい順のリスト（yfinanceの.dropna().tolist()形式）
+
+    在庫が事業規模に対して意味のある金額を持つ企業（在庫/売上高比率5%以上）に限定し、
+    在庫成長率が売上成長率を大幅に上回る場合（差20pt以上）を危険信号とする。
+    在庫が僅少な企業（IT・サービス業等）はノイズが大きいため対象外とする。
+
+    戻り値: dict または None（データ不足・対象外時）
+    """
+    if not inventory_series or not revenue_series:
+        return None
+    if len(inventory_series) < 2 or len(revenue_series) < 2:
+        return None
+
+    inv_latest, inv_prev = inventory_series[0], inventory_series[1]
+    rev_latest, rev_prev = revenue_series[0], revenue_series[1]
+
+    if not inv_prev or not rev_prev or not rev_latest:
+        return None
+
+    inv_to_rev_latest = inv_latest / rev_latest
+    inv_to_rev_prev = inv_prev / rev_prev if rev_prev else None
+
+    # 在庫が売上高比5%未満の企業は「在庫ビジネスではない」と判断し対象外とする
+    # （ノイズの大きい極小在庫の成長率変動を排除）
+    MIN_INVENTORY_TO_REVENUE_RATIO = 0.05
+    if inv_to_rev_latest < MIN_INVENTORY_TO_REVENUE_RATIO:
+        return {
+            "inv_growth_pct": None,
+            "rev_growth_pct": None,
+            "growth_gap_pct": None,
+            "inv_to_rev_ratio_latest": round(inv_to_rev_latest, 3),
+            "inv_to_rev_ratio_change": None,
+            "is_inventory_risk": False,
+            "skip_reason": "在庫規模が僅少（対象外）",
+        }
+
+    inv_growth = (inv_latest - inv_prev) / inv_prev * 100
+    rev_growth = (rev_latest - rev_prev) / rev_prev * 100
+    gap = inv_growth - rev_growth
+    ratio_change = (inv_to_rev_latest - inv_to_rev_prev) if inv_to_rev_prev else None
+
+    return {
+        "inv_growth_pct": round(inv_growth, 1),
+        "rev_growth_pct": round(rev_growth, 1),
+        "growth_gap_pct": round(gap, 1),
+        "inv_to_rev_ratio_latest": round(inv_to_rev_latest, 3),
+        "inv_to_rev_ratio_change": round(ratio_change, 3) if ratio_change is not None else None,
+        "is_inventory_risk": gap > 20,
+    }
+
+
 def calc_asset_undervaluation_score(ticker, market_cap, current_assets, total_liab,
-                                      investments=0, mapping=None, fiscal_year_end=None):
+                                      investments=0, mapping=None, fiscal_year_end=None,
+                                      inventory_series=None, revenue_series=None,
+                                      minority_interest=0):
     """
     資産過小評価スコアを計算する。
     NCAV + 投資有価証券(時価) + 賃貸等不動産の含み益 - 税効果額 を時価総額と比較し、
@@ -372,8 +472,10 @@ def calc_asset_undervaluation_score(ticker, market_cap, current_assets, total_li
     if current_assets is None or total_liab is None:
         return None
 
-    ncav = current_assets - total_liab
-    vd_data, rp_data = _get_xbrl_data(ticker, mapping, fiscal_year_end)
+    # NCAV = 流動資産 - 負債総額 - 非支配株主持分
+    # （連結純資産から非支配株主持分を除き、親会社株主に帰属する清算価値のみを算出）
+    ncav = current_assets - total_liab - (minority_interest or 0)
+    vd_data, rp_data, rb_data = _get_xbrl_data(ticker, mapping, fiscal_year_end)
 
     deferred_tax = vd_data.get("deferred_tax", 0) if vd_data else 0
     rental_gain  = rp_data.get("unrealized_gain", 0) if rp_data else 0
@@ -387,11 +489,26 @@ def calc_asset_undervaluation_score(ticker, market_cap, current_assets, total_li
     ratio = (market_cap / ncav_plus_adj) if ncav_plus_adj and ncav_plus_adj > 0 else None
     is_undervalued = (ratio is not None and ratio < 1.0)
 
+    inventory_risk = calc_inventory_risk(inventory_series, revenue_series)
+
+    # 退職給付の未認識数理計算上の差異の警告判定
+    # （すでにBS負債に反映済みのため減算はしないが、純資産対比で大きい場合は警告フラグとする）
+    retirement_risk_flag = False
+    if rb_data and rb_data.get("unrealized_diff"):
+        diff = rb_data["unrealized_diff"]
+        # NCAV（簡易的に純資産規模の代理）の5%以上を「大きい」とみなす
+        if ncav and abs(diff) >= ncav * 0.05:
+            retirement_risk_flag = True
+
     return {
         "ncav": round(ncav, 0),
+        "minority_interest_excluded": round(minority_interest or 0, 0),
         "ncav_plus_tax_adjusted": round(ncav_plus_adj, 0),
         "valuation_diff_data": vd_data,
         "rental_property_data": rp_data,
+        "inventory_risk_data": inventory_risk,
+        "retirement_benefit_data": rb_data,
+        "is_retirement_risk": retirement_risk_flag,
         "undervaluation_ratio": round(ratio, 3) if ratio is not None else None,
         "is_undervalued": is_undervalued,
     }
