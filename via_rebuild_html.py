@@ -50,6 +50,7 @@ def calc_moat_score(row, moat_db):
             "moat_types": types, "moat_comment": comment, "moat_risk": risk}
 
 def _asset_cell(row):
+    """資産過小評価の総合比率セル"""
     ratio = row.get("asset_undervaluation_ratio")
     if ratio is None or str(ratio) in ("", "nan", "None"):
         return '<td class="n">—</td>'
@@ -58,25 +59,62 @@ def _asset_cell(row):
     except Exception:
         return '<td class="n">—</td>'
     is_uv = str(row.get("is_asset_undervalued","")).lower() == "true"
-    vd = row.get("valuation_diff")
-    rp = row.get("rental_property_gain")
-    parts = []
-    try:
-        vd_f = float(vd)
-        parts.append(f"評価差額金:{vd_f:,.0f}円")
-    except Exception:
-        pass
-    try:
-        rp_f = float(rp)
-        if rp_f and rp_f == rp_f:  # NaN チェック（NaN != NaN）
-            parts.append(f"賃貸不動産含み益:{rp_f:,.0f}円")
-    except Exception:
-        pass
-    tooltip = " | ".join(parts)
     cls = "uv-yes" if is_uv else ""
     star = " ★" if is_uv else ""
-    return f'<td class="{cls}" title="{tooltip}">資産{ratio_f:.2f}{star}</td>'
+    return f'<td class="{cls}" title="時価総額/NCAV-Plus(清算価値)。1.0未満で過小評価">{ratio_f:.2f}{star}</td>'
 
+
+def _valuation_diff_cell(row):
+    """その他有価証券評価差額金セル"""
+    vd = row.get("valuation_diff")
+    try:
+        vd_f = float(vd)
+        if vd_f == vd_f:
+            disp = f"{vd_f/1e6:,.0f}百万円" if abs(vd_f) >= 1e6 else f"{vd_f:,.0f}円"
+            return f'<td class="num" title="保有する上場株式等の評価差額金(税効果後)">{disp}</td>'
+    except Exception:
+        pass
+    return '<td class="n">—</td>'
+
+
+def _rental_property_cell(row):
+    """賃貸等不動産の含み益セル"""
+    rp = row.get("rental_property_gain")
+    try:
+        rp_f = float(rp)
+        if rp_f == rp_f and rp_f != 0:
+            disp = f"{rp_f/1e6:,.0f}百万円" if abs(rp_f) >= 1e6 else f"{rp_f:,.0f}円"
+            return f'<td class="num uv-yes" title="賃貸用不動産の時価-BS計上額">{disp}</td>'
+    except Exception:
+        pass
+    return '<td class="n">—</td>'
+
+
+def _inventory_risk_cell(row):
+    """棚卸資産急増リスクセル"""
+    is_risk = str(row.get("is_inventory_risk","")).lower() == "true"
+    gap = row.get("inventory_growth_gap_pct")
+    if not is_risk:
+        return '<td class="n">—</td>'
+    try:
+        gap_f = float(gap)
+        return f'<td class="trap-warn" title="在庫成長率が売上成長率を{gap_f:.0f}pt上回る">⚠+{gap_f:.0f}pt</td>'
+    except Exception:
+        return '<td class="trap-warn">⚠</td>'
+
+
+def _retirement_risk_cell(row):
+    """退職給付未認識差異リスクセル"""
+    is_risk = str(row.get("is_retirement_risk","")).lower() == "true"
+    diff = row.get("retirement_unrealized_diff")
+    if not is_risk:
+        return '<td class="n">—</td>'
+    try:
+        diff_f = float(diff)
+        disp = f"{diff_f/1e6:,.0f}百万円" if abs(diff_f) >= 1e6 else f"{diff_f:,.0f}円"
+        return f'<td class="trap-warn" title="年金の未認識数理計算上の差異">⚠{disp}</td>'
+    except Exception:
+        return '<td class="trap-warn">⚠</td>'
 
 def _moat_cell(moat):
     score = moat.get("moat_score", 0)
@@ -343,7 +381,11 @@ def make_html(df_all, total_input, generated, moat_db=None):
             f'<td class="num">{itr or "—"}</td>'
             f'{uv_cell}'
             f'{_asset_cell(row)}'
-            f'{_moat_cell(moat)}'
+              f'{_valuation_diff_cell(row)}'
+              f'{_rental_property_cell(row)}'
+              f'{_inventory_risk_cell(row)}'
+              f'{_retirement_risk_cell(row)}'
+              f'{_moat_cell(moat)}'
             f'<td class="gr" data-rate="{raw_f}">{raw if raw and str(raw) not in ("","nan","None") else ""}</td>'
             f'<td class="num">{row.get("latest_EPS","")}</td>'
             f'<td class="num">{row.get("latest_ROE","")}</td>'
@@ -448,11 +490,16 @@ td.gr{{text-align:right;font-variant-numeric:tabular-nums}}
   <th onclick="sortTable(4)">スコア</th><th onclick="sortTable(5)">判定</th>
   <th onclick="sortTable(6)">現在株価</th><th onclick="sortTable(7)">購買ターゲット価格</th>
   <th onclick="sortTable(8)">正味現在価値</th><th onclick="sortTable(9)">割安判定</th>
-  <th onclick="sortTable(10)">モート</th>
-  <th onclick="sortTable(11)">成長率%</th>
-  <th onclick="sortTable(11)">EPS</th><th onclick="sortTable(12)">ROE%</th>
-  <th onclick="sortTable(13)">ROA%</th><th onclick="sortTable(14)">ROIC%</th>
-  <th onclick="sortTable(15)">D/E%</th>
+  <th onclick="sortTable(10)">資産評価<br>(時価総額/NCAV+)</th>
+  <th onclick="sortTable(11)">有価証券<br>評価差額金</th>
+  <th onclick="sortTable(12)">賃貸不動産<br>含み益</th>
+  <th onclick="sortTable(13)">在庫<br>リスク</th>
+  <th onclick="sortTable(14)">退職給付<br>リスク</th>
+  <th onclick="sortTable(15)">モート</th>
+  <th onclick="sortTable(16)">成長率%</th>
+  <th onclick="sortTable(17)">EPS</th><th onclick="sortTable(18)">ROE%</th>
+  <th onclick="sortTable(19)">ROA%</th><th onclick="sortTable(20)">ROIC%</th>
+  <th onclick="sortTable(21)">D/E%</th>
   {th}
 </tr></thead>
 <tbody>{"".join(rows_html)}</tbody>
