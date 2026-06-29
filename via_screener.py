@@ -38,6 +38,7 @@ STRICT = dict(
     roic_thr    = 15,
     consec_drop = 2,
     max_years   = 9,    # 最大9年分で評価（古すぎるデータを除外）
+    min_years   = 5,    # EPS上昇期間として必要な最低年数（厳格基準）
 )
 RELAXED = dict(
     pass_ratio   = 0.70,
@@ -47,6 +48,7 @@ RELAXED = dict(
     roic_thr     = 10,
     consec_drop  = 3,
     recent_years = 4,   # 直近4年のデータのみで評価
+    min_years    = 4,   # EPS上昇期間として必要な最低年数（緩和基準）
 )
 
 # ── J-Quants API設定（日本株）──
@@ -893,7 +895,18 @@ def get_jp_financials(code4):
     try:
         data = _jquants_fetch("/fins/summary", f"code={code4}")
         stmts = data.get("data", [])
-        fy = [s for s in stmts if "FYFinancialStatements" in s.get("DocType","")]
+        fy_all = [s for s in stmts if "FYFinancialStatements" in s.get("DocType","")]
+
+        # 同一決算期（CurFYEn）に複数の開示がある場合（訂正報告書等）は
+        # 最新のDiscDateのもののみを残す（重複除去）
+        fy_by_period = {}
+        for s in fy_all:
+            period = s.get("CurFYEn", "")
+            disc_date = s.get("DiscDate", "")
+            if period not in fy_by_period or disc_date > fy_by_period[period].get("DiscDate",""):
+                fy_by_period[period] = s
+        fy = sorted(fy_by_period.values(), key=lambda x: x.get("DiscDate",""))
+
         if not fy:
             _jq_cache[code4] = empty
             return empty
@@ -1119,6 +1132,44 @@ def is_uptrend(arr, consec_limit=2):
             consec = 0
     return True
 
+
+def is_eps_uptrend(arr, required_years):
+    """
+    EPS専用の上昇トレンド判定（is_uptrendとは判定基準が異なる）。
+
+    直近required_years年分（厳格=5年、緩和=4年）のEPSのみを取り出し、
+    その固定期間内で判定する（絶対条件）。
+
+    判定基準:
+      下落0回 → 合格
+      下落1回かつ単年度（2年連続でない）→ 例外として合格（一時的要因と判断）
+      下落2回以上 → 不合格
+      2年連続の下落が1度でもあれば → 不合格（下落回数に関わらず）
+    """
+    vals = [v for v in arr if v is not None and not np.isnan(float(v))]
+    if len(vals) < required_years:
+        return False
+
+    recent = vals[-required_years:]
+
+    decline_count = 0
+    consec_decline = 0
+    max_consec = 0
+    for i in range(len(recent) - 1):
+        if recent[i+1] < recent[i]:
+            decline_count += 1
+            consec_decline += 1
+            max_consec = max(max_consec, consec_decline)
+        else:
+            consec_decline = 0
+
+    if max_consec >= 2:
+        return False
+    if decline_count >= 2:
+        return False
+
+    return True
+
 def is_stable(arr):
     vals = [v for v in arr if v is not None and not np.isnan(float(v))]
     if len(vals) < 2: return False
@@ -1183,7 +1234,7 @@ def run_criteria(eps, gm_arr, ocf, fcf, roe_arr, roa_arr,
     gm_ok, gm_note = gm_judge(gm_arr, cfg)
     res = {
         "EPS_positive":   pct_positive(eps)              >= pr if eps      else False,
-        "EPS_uptrend":    is_uptrend(eps, cd)                   if eps      else False,
+        "EPS_uptrend":    is_eps_uptrend(eps, cfg.get("min_years", 4)) if eps else False,
         "GM_judge":       gm_ok,
         "OCF_positive":   pct_positive(ocf)              >= pr if ocf      else False,
         "OCF_uptrend":    is_uptrend(ocf, cd)                   if ocf      else False,
@@ -1885,16 +1936,30 @@ def make_html(df_all, total_input, generated):
                       + (f'<span class="r-score"> ({rs}/{rt})</span>'
                          if g=="RELAXED" else ""))
         asset_ratio = row.get("asset_undervaluation_ratio")
-        is_asset_uv = row.get("is_asset_undervalued")
+        is_asset_uv = str(row.get("is_asset_undervalued","")).strip().lower() == "true"
         vd = row.get("valuation_diff")
         rp_gain = row.get("rental_property_gain")
-        if pd.notna(asset_ratio) if hasattr(pd, "notna") else (asset_ratio is not None):
-            tooltip_parts = [f"評価差額金:{vd if vd else 0:,.0f}円"]
-            if rp_gain and (not pd.isna(rp_gain) if hasattr(pd,"isna") else True):
-                tooltip_parts.append(f"賃貸不動産含み益:{rp_gain:,.0f}円")
+        try:
+            asset_ratio_f = float(asset_ratio)
+            if asset_ratio_f != asset_ratio_f:  # NaNチェック(NaN != NaN)
+                asset_ratio_f = None
+        except Exception:
+            asset_ratio_f = None
+        if asset_ratio_f is not None:
+            try:
+                vd_f = float(vd)
+            except Exception:
+                vd_f = 0.0
+            tooltip_parts = [f"評価差額金:{vd_f:,.0f}円"]
+            try:
+                rp_f = float(rp_gain)
+            except Exception:
+                rp_f = 0.0
+            if rp_f:
+                tooltip_parts.append(f"賃貸不動産含み益:{rp_f:,.0f}円")
             tooltip = " | ".join(tooltip_parts)
             asset_cell = (f'<td class="uv-yes" title="{tooltip}">'
-                          f'資産{asset_ratio:.2f} {"★" if is_asset_uv else ""}</td>')
+                          f'資産{asset_ratio_f:.2f} {"★" if is_asset_uv else ""}</td>')
         else:
             asset_cell = '<td class="n">—</td>'
 
