@@ -1903,7 +1903,8 @@ def _moat_cell(row):
             f'{label} {int(score_f)}</td>')
 
 
-def make_html(df_all, total_input, generated):
+def make_html(df_all, total_input, generated, moat_db=None):
+    if moat_db is None: moat_db = {}
     df = df_all[df_all["grade"].isin(["STRICT","RELAXED"])].copy()
     n_s    = len(df[df["grade"]=="STRICT"])
     n_r    = len(df[df["grade"]=="RELAXED"])
@@ -1963,6 +1964,8 @@ def make_html(df_all, total_input, generated):
         else:
             asset_cell = '<td class="n">—</td>'
 
+        moat_info = calc_moat_score(row.to_dict() if hasattr(row, "to_dict") else dict(row), moat_db)
+
         rows.append(
             f'<tr data-grade="{g}" data-uv="{"1" if uv else "0"}">'
             f'<td>{row.get("market","")}</td>'
@@ -1976,7 +1979,7 @@ def make_html(df_all, total_input, generated):
             f'<td class="num">{itr or "—"}</td>'
             f'{uv_cell}'
             f'{asset_cell}'
-            f'{_moat_cell(row)}'
+            f'{_moat_cell(moat_info)}'
             f'<td class="gr" data-rate="{row.get("dcf_raw_rate") or 0}">{row.get("dcf_raw_rate","")}</td>'
             f'<td class="num">{row.get("latest_EPS","")}</td>'
             f'<td class="num">{row.get("latest_ROE","")}</td>'
@@ -2272,7 +2275,7 @@ def main():
 
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
-        f.write(make_html(df_valid, total, generated))
+        f.write(make_html(df_valid, total, generated, _MOAT_DATA))
     print(f"HTML出力: {OUTPUT_HTML}")
 
     n_s    = len(df_valid[df_valid["grade"]=="STRICT"])
