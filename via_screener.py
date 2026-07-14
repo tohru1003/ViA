@@ -1027,11 +1027,14 @@ def get_jp_financials(code4):
         return empty
 
 
-def calc_asset_undervaluation(ticker, market, market_cap):
+def calc_asset_undervaluation(ticker, market, market_cap, net_income=None):
     """
     VIA通過銘柄（日本株）について、資産面の過小評価要因を計算する。
     NCAV（流動資産-負債総額）+ 投資有価証券（時価）- 税効果額（評価差額金から逆算）
     を時価総額と比較し、過小評価スコアを返す。
+
+    net_income: 当期純利益（最新期）。渡された場合、オーナーズ・アーニングス
+                （純利益+減価償却費-設備投資）も併せて計算する。
 
     米国株、または_edinetモジュールが無い場合はNoneを返す（スキップ）。
     """
@@ -1093,6 +1096,7 @@ def calc_asset_undervaluation(ticker, market, market_cap):
             fiscal_year_end=fiscal_year_end,
             inventory_series=inventory_series, revenue_series=revenue_series,
             minority_interest=minority_interest,
+            net_income=net_income,
         )
         return result
     except Exception:
@@ -1257,6 +1261,28 @@ def run_criteria(eps, gm_arr, ocf, fcf, roe_arr, roa_arr,
 
 # ── DCF ───────────────────────────────────────────────
 
+def _dcf_two_stage_value(base_earnings, adj_rate):
+    """
+    2段階DCFモデルのコア計算部分（成長期cy年 + 継続期sy年）。
+    calc_dcf()・calc_oe_dcf()の両方から共通で呼ばれる。
+    base_earnings: 基準となる1株あたり収益（EPS または オーナーズ・アーニングスper share）
+    adj_rate: 調整後成長率（%）
+    戻り値: (intrinsic, 買いターゲット価格) または base_earnings<=0の場合None
+    """
+    if base_earnings is None or base_earnings <= 0:
+        return None
+    dr = DCF_DISC_RATE/100; ar = adj_rate/100
+    ir = DCF_INFL_RATE/100; cy = DCF_CONT_YEARS; sy = DCF_SURV_YEARS
+    g0 = (1+ar)/(1+dr)
+    gv = (base_earnings*cy if abs(g0-1)<1e-9
+          else base_earnings*g0*(1-pow(g0,cy))/(1-g0))
+    s0 = (1+ir)/(1+dr); s2 = pow(g0,cy)
+    sv = (base_earnings*s2*sy if abs(s0-1)<1e-9
+          else base_earnings*s2*s0*(1-pow(s0,sy))/(1-s0))
+    intrinsic = gv + sv
+    return intrinsic, intrinsic*(1-DCF_MARGIN_SAFE/100)
+
+
 def calc_dcf(eps_series):
     vals = [v for v in eps_series if v is not None and not np.isnan(float(v))]
     if len(vals) < 2: return None
@@ -1287,17 +1313,12 @@ def calc_dcf(eps_series):
     except Exception:
         return None
     adj_rate = min(max(raw_rate / 2.0, 1.0), DCF_ADJ_CAP)
-    dr = DCF_DISC_RATE/100; ar = adj_rate/100
-    ir = DCF_INFL_RATE/100; cy = DCF_CONT_YEARS; sy = DCF_SURV_YEARS
-    g0 = (1+ar)/(1+dr)
-    gv = (present_eps*cy if abs(g0-1)<1e-9
-          else present_eps*g0*(1-pow(g0,cy))/(1-g0))
-    s0 = (1+ir)/(1+dr); s2 = pow(g0,cy)
-    sv = (present_eps*s2*sy if abs(s0-1)<1e-9
-          else present_eps*s2*s0*(1-pow(s0,sy))/(1-s0))
-    intrinsic = gv + sv
+    result = _dcf_two_stage_value(present_eps, adj_rate)
+    if result is None:
+        return None
+    intrinsic, buy_price = result
     return {
-        "dcf_buy_price":   round(intrinsic*(1-DCF_MARGIN_SAFE/100), 2),
+        "dcf_buy_price":   round(buy_price, 2),
         "dcf_intrinsic":   round(intrinsic, 2),
         "dcf_adj_rate":    round(adj_rate,  2),
         "dcf_raw_rate":    round(raw_rate,  2),
@@ -1305,6 +1326,83 @@ def calc_dcf(eps_series):
         "dcf_past_eps":    round(past_eps,  2),
         "dcf_present_eps": round(present_eps, 2),
     }
+
+
+def calc_oe_dcf(oe_per_share, growth_rate_pct):
+    """
+    オーナーズ・アーニングス基準の正味現在価値を、EPS基準DCFと同じ
+    2段階モデルで算出する。オーナーズ・アーニングスは単年データしか
+    無いため、成長率はEPSトレンドから算出済みの値（dcf_raw_rate）を
+    そのまま流用する（＝「同じ成長シナリオなら、GAAP利益ではなく
+    実質キャッシュ創出力を基準にするといくらになるか」という比較値）。
+
+    戻り値: dict {oe_dcf_intrinsic, oe_dcf_buy_price} または算出不可の場合None
+    """
+    if oe_per_share is None or oe_per_share <= 0 or growth_rate_pct is None:
+        return None
+    if oe_per_share != oe_per_share or growth_rate_pct != growth_rate_pct:  # NaNチェック
+        return None
+    adj_rate = min(max(growth_rate_pct / 2.0, 1.0), DCF_ADJ_CAP)
+    result = _dcf_two_stage_value(oe_per_share, adj_rate)
+    if result is None:
+        return None
+    intrinsic, buy_price = result
+    return {
+        "oe_dcf_intrinsic": round(intrinsic, 2),
+        "oe_dcf_buy_price": round(buy_price, 2),
+    }
+
+
+def calc_peg(price, dcf):
+    """
+    PEGレシオ = PER ÷ EPS成長率(%)
+    PER = 株価 ÷ 直近EPS（calc_dcf()のdcf_present_eps）
+    成長率 = calc_dcf()のdcf_raw_rate（%表記の数値、例: 15.0 なら15%）
+    一般的な目安として PEG<1 で「成長率の割に割安」とされる（簡易指標であり
+    2段階DCFほど厳密ではない点に注意。あくまで一覧比較用の補助指標）。
+
+    株価・EPS・成長率のいずれかが欠けている、またはEPS/成長率が0以下で
+    計算が破綻する場合はNoneを返す。
+    また、EPSがほぼゼロに近い銘柄はPERが異常値になりPEGも意味をなさなく
+    なるため、PER>300（他のDCF妥当性チェックと同じ閾値）または
+    結果のPEG>50は「比較不能」としてNoneを返す（外れ値として表示しない）。
+    """
+    if not dcf or not price or price <= 0:
+        return None
+    eps = dcf.get("dcf_present_eps")
+    growth = dcf.get("dcf_raw_rate")
+    if not eps or eps <= 0 or not growth or growth <= 0:
+        return None
+    if eps != eps or growth != growth:  # NaNチェック
+        return None
+    per = price / eps
+    if per > 300:
+        return None
+    peg = round(per / growth, 2)
+    if peg > 50:
+        return None
+    return peg
+
+
+def calc_epv(base_earnings, wacc_pct=WACC):
+    """
+    EPV（Earnings Power Value、収益力価値）= 正常化収益 ÷ 資本コスト(WACC)。
+    グリーンウォルド流の「成長ゼロを仮定した場合の1株あたり企業価値」。
+    DCF正味現在価値（成長込み）と対比することで、
+    「今の市場評価がどれだけ将来の成長を織り込んでいるか」の目安になる。
+
+    base_earnings: 1株あたりの基準収益（EPS、またはオーナーズ・アーニングス
+                   per share）。このスクリーナーでは複数年のEBITマージンを
+                   正常化する本来のグリーンウォルド法ではなく、直近1年の
+                   値をそのまま使う簡易版である点に注意。
+
+    base_earnings・wacc_pctが欠けている、0以下、NaNの場合はNoneを返す。
+    """
+    if base_earnings is None or base_earnings <= 0 or not wacc_pct or wacc_pct <= 0:
+        return None
+    if base_earnings != base_earnings:  # NaNチェック
+        return None
+    return round(base_earnings / (wacc_pct / 100), 2)
 
 
 # ── 銘柄評価 ──────────────────────────────────────────
@@ -1509,6 +1607,8 @@ def process_ticker(ticker, market):
                 bp = dcf["dcf_buy_price"] if dcf else None
                 undervalued = (price < bp) if bp and price and price > 0 else None
                 margin_pct  = round((bp-price)/bp*100, 1) if bp and price and price > 0 else None
+                peg_ratio = calc_peg(price, dcf)
+                epv_eps = calc_epv(dcf.get("dcf_present_eps") if dcf else None)
 
                 return {
                     "ticker": ticker, "name": name,
@@ -1528,6 +1628,8 @@ def process_ticker(ticker, market):
                         "dcf_years_back":None, "dcf_past_eps":  None,
                         "dcf_present_eps":None,
                     }),
+                    "peg_ratio": peg_ratio,
+                    "epv_eps": epv_eps,
                     "dcf_skip_reason": None,
                     "undervalued": undervalued,
                     "margin_pct":  margin_pct,
@@ -1537,6 +1639,7 @@ def process_ticker(ticker, market):
                     "latest_ROA":  _jq_last(roa_arr),
                     "latest_DE":   _jq_last(de_arr),
                     "latest_ROIC": _jq_last(roic_arr),
+                    "latest_NP":   _jq_last(jq.get("np", [])),
                 }
 
         # ── 米国株: EODHDを使用 ──
@@ -1614,6 +1717,8 @@ def process_ticker(ticker, market):
                 bp = dcf["dcf_buy_price"] if dcf else None
                 uv = (price < bp) if bp and price and price > 0 else None
                 mp = round((bp-price)/bp*100,1) if bp and price and price>0 else None
+                peg_ratio = calc_peg(price, dcf)
+                epv_eps = calc_epv(dcf.get("dcf_present_eps") if dcf else None)
 
                 def last(arr):
                     v=[x for x in arr if x is not None and not np.isnan(float(x))]
@@ -1637,6 +1742,8 @@ def process_ticker(ticker, market):
                         "dcf_years_back": None, "dcf_past_eps": None,
                         "dcf_present_eps": None,
                     }),
+                    "peg_ratio": peg_ratio,
+                    "epv_eps": epv_eps,
                     "dcf_skip_reason": None,
                     "undervalued": uv, "margin_pct": mp,
                     "latest_EPS": last(eps),
@@ -1791,6 +1898,8 @@ def process_ticker(ticker, market):
         bp  = dcf["dcf_buy_price"] if dcf else None
         undervalued = (price < bp) if bp and price and price > 0 else None
         margin_pct  = round((bp-price)/bp*100,1) if bp and price and price>0 else None
+        peg_ratio = calc_peg(price, dcf)
+        epv_eps = calc_epv(dcf.get("dcf_present_eps") if dcf else None)
 
         def last(arr):
             v = [x for x in arr if x is not None and not np.isnan(float(x))]
@@ -1814,6 +1923,8 @@ def process_ticker(ticker, market):
                 "dcf_years_back":None, "dcf_past_eps":    None,
                 "dcf_present_eps":None,
             }),
+            "peg_ratio": peg_ratio,
+            "epv_eps": epv_eps,
             "dcf_skip_reason": dcf_skip_reason,
             "undervalued": undervalued,
             "margin_pct":  margin_pct,
@@ -1933,6 +2044,61 @@ def make_html(df_all, total_input, generated, moat_db=None):
         uv_cell = (f'<td class="uv-yes">割安 ({mp:+.1f}%)</td>' if uv is True
                    else f'<td class="uv-no">割高 ({mp:+.1f}%)</td>' if uv is False
                    else '<td class="n">—</td>')
+
+        # ── PEGレシオセル ──
+        # PEG = PER ÷ EPS成長率(%)。1未満で「成長率の割に割安」の簡易目安
+        # （2段階DCFほど厳密ではない一覧比較用の補助指標）。
+        peg = row.get("peg_ratio")
+        try:
+            peg_f = float(peg)
+            if peg_f != peg_f:
+                peg_f = None
+        except Exception:
+            peg_f = None
+        if peg_f is not None:
+            peg_color = "uv-yes" if 0 < peg_f < 1 else ("uv-no" if peg_f > 2 else "")
+            peg_cell = (f'<td class="{peg_color}" '
+                        f'title="PER÷EPS成長率。1未満で成長率対比の割安目安（簡易指標）">'
+                        f'{peg_f:.2f}</td>')
+        else:
+            peg_cell = '<td class="n">—</td>'
+
+        # ── EPV（Earnings Power Value）倍率セル ──
+        # EPV = 基準収益 ÷ WACC（成長ゼロ仮定の1株あたり企業価値）。
+        # 日本株はオーナーズ・アーニングス基準（epv_oe、より精度が高い）を
+        # 優先し、無ければEPS基準（epv_eps、全市場共通）にフォールバックする。
+        # EPV倍率 = 株価 ÷ EPV。1未満で「成長ゼロでも割安」の目安。
+        epv_oe  = row.get("epv_oe")
+        epv_eps = row.get("epv_eps")
+        epv_val, epv_basis = None, None
+        try:
+            epv_val = float(epv_oe)
+            if epv_val == epv_val and epv_val > 0:
+                epv_basis = "OE"
+            else:
+                epv_val = None
+        except Exception:
+            epv_val = None
+        if epv_val is None:
+            try:
+                v = float(epv_eps)
+                if v == v and v > 0:
+                    epv_val, epv_basis = v, "EPS"
+            except Exception:
+                pass
+        try:
+            price_val = float(pr)
+        except Exception:
+            price_val = None
+        if epv_val and price_val and price_val > 0:
+            epv_ratio = round(price_val / epv_val, 2)
+            epv_color = "uv-yes" if epv_ratio < 1 else ("uv-no" if epv_ratio > 2 else "")
+            epv_tip = (f"EPV（{epv_basis}基準、成長ゼロ仮定）:{epv_val:,.0f}円 | "
+                       f"株価÷EPV。1未満で現状の収益力だけでも割安の目安（簡易指標）")
+            epv_cell = f'<td class="{epv_color}" title="{epv_tip}">{epv_ratio:.2f}</td>'
+        else:
+            epv_cell = '<td class="n">—</td>'
+
         score_disp = (f'{ss}/{st}'
                       + (f'<span class="r-score"> ({rs}/{rt})</span>'
                          if g=="RELAXED" else ""))
@@ -1964,6 +2130,59 @@ def make_html(df_all, total_input, generated, moat_db=None):
         else:
             asset_cell = '<td class="n">—</td>'
 
+        # ── オーナーズ・アーニングス利回りセル ──
+        oe_yield = row.get("owner_earnings_yield")
+        oe_val   = row.get("owner_earnings")
+        oe_dep   = row.get("oe_depreciation")
+        oe_capex = row.get("oe_capex")
+        oe_dep_is_fb   = str(row.get("oe_depreciation_is_fallback", "")).strip().lower() == "true"
+        oe_capex_is_fb = str(row.get("oe_capex_is_fallback", "")).strip().lower() == "true"
+        oe_is_fb = oe_dep_is_fb or oe_capex_is_fb
+        oe_dcf_intrinsic = row.get("oe_dcf_intrinsic")
+        oe_dcf_buy_price = row.get("oe_dcf_buy_price")
+        oe_dcf_gap_pct   = row.get("oe_dcf_gap_pct")
+        try:
+            oe_yield_f = float(oe_yield)
+            if oe_yield_f != oe_yield_f:
+                oe_yield_f = None
+        except Exception:
+            oe_yield_f = None
+        if oe_yield_f is not None:
+            try:
+                oe_val_f = float(oe_val)
+            except Exception:
+                oe_val_f = None
+            tip_parts = []
+            if oe_val_f is not None:
+                tip_parts.append(f"オーナーズ・アーニングス:{oe_val_f:,.0f}円")
+            try:
+                tip_parts.append(f"減価償却費:{float(oe_dep):,.0f}円" + ("(概要タグ代用)" if oe_dep_is_fb else ""))
+            except Exception:
+                pass
+            try:
+                tip_parts.append(f"設備投資:{float(oe_capex):,.0f}円" + ("(概要タグ代用)" if oe_capex_is_fb else ""))
+            except Exception:
+                pass
+            gap_f = None
+            try:
+                gap_f = float(oe_dcf_gap_pct)
+            except Exception:
+                pass
+            try:
+                tip_parts.append(f"OE基準正味現在価値:{float(oe_dcf_intrinsic):,.0f}円"
+                                  f"(買いターゲット{float(oe_dcf_buy_price):,.0f}円)"
+                                  + (f" ※EPS基準比{gap_f:+.0f}%" if gap_f is not None else ""))
+            except Exception:
+                pass
+            tip_parts.append("成長率はEPSトレンド由来を流用した参考値")
+            oe_tip = " | ".join(tip_parts)
+            oe_color = "uv-yes" if oe_yield_f >= 5 else ""
+            hidden_value_mark = " 💎" if (gap_f is not None and gap_f >= 20) else ""
+            oe_cell = (f'<td class="{oe_color}" title="{oe_tip}">'
+                       f'{oe_yield_f:.1f}%{" ※" if oe_is_fb else ""}{hidden_value_mark}</td>')
+        else:
+            oe_cell = '<td class="n">—</td>'
+
         moat_info = calc_moat_score(row.to_dict() if hasattr(row, "to_dict") else dict(row), moat_db)
 
         rows.append(
@@ -1978,7 +2197,10 @@ def make_html(df_all, total_input, generated, moat_db=None):
             f'<td class="num">{(str(bp) + " ✓") if bp else ("— " + str(row.get("dcf_skip_reason",""))[:20] if row.get("dcf_skip_reason") else "—")}</td>'
             f'<td class="num">{itr or "—"}</td>'
             f'{uv_cell}'
+            f'{peg_cell}'
+            f'{epv_cell}'
             f'{asset_cell}'
+            f'{oe_cell}'
             f'{_moat_cell(moat_info)}'
             f'<td class="gr" data-rate="{row.get("dcf_raw_rate") or 0}">{row.get("dcf_raw_rate","")}</td>'
             f'<td class="num">{row.get("latest_EPS","")}</td>'
@@ -2073,14 +2295,17 @@ td.uv-no{{color:#993C1D;font-size:11px}}
   <th onclick="sortTable(7)">購買ターゲット価格</th>
   <th onclick="sortTable(8)">正味現在価値</th>
   <th onclick="sortTable(9)">割安判定</th>
-  <th onclick="sortTable(10)">資産過小評価</th>
-  <th onclick="sortTable(11)">モート</th>
-  <th onclick="sortTable(12)">成長率%</th>
-  <th onclick="sortTable(12)">EPS</th>
-  <th onclick="sortTable(13)">ROE%</th>
-  <th onclick="sortTable(14)">ROA%</th>
-  <th onclick="sortTable(15)">ROIC%</th>
-  <th onclick="sortTable(16)">D/E%</th>
+  <th onclick="sortTable(10)">PEG</th>
+  <th onclick="sortTable(11)">EPV倍率</th>
+  <th onclick="sortTable(12)">資産過小評価</th>
+  <th onclick="sortTable(13)">OE利回り</th>
+  <th onclick="sortTable(14)">モート</th>
+  <th onclick="sortTable(15)">成長率%</th>
+  <th onclick="sortTable(15)">EPS</th>
+  <th onclick="sortTable(16)">ROE%</th>
+  <th onclick="sortTable(17)">ROA%</th>
+  <th onclick="sortTable(18)">ROIC%</th>
+  <th onclick="sortTable(19)">D/E%</th>
   {th}
 </tr></thead>
 <tbody>{"".join(rows)}</tbody>
@@ -2242,7 +2467,12 @@ def main():
             except Exception:
                 mcap = None
             print(f"  {ticker:<10}", end=" ", flush=True)
-            asset_result = calc_asset_undervaluation(ticker, row["market"], mcap)
+            net_income = row.get("latest_NP")
+            try:
+                net_income = float(net_income) if net_income is not None and net_income != "" else None
+            except (TypeError, ValueError):
+                net_income = None
+            asset_result = calc_asset_undervaluation(ticker, row["market"], mcap, net_income=net_income)
             if asset_result:
                 def _s(v):
                     return str(v) if v is not None else None
@@ -2262,9 +2492,61 @@ def main():
                 rb_data = asset_result.get("retirement_benefit_data") or {}
                 df_valid.at[idx, "retirement_unrealized_diff"] = _s(rb_data.get("unrealized_diff"))
                 df_valid.at[idx, "is_retirement_risk"] = _s(asset_result.get("is_retirement_risk"))
+                oe_raw = asset_result.get("owner_earnings_data") or {}
+                df_valid.at[idx, "owner_earnings"] = _s(asset_result.get("owner_earnings"))
+                df_valid.at[idx, "owner_earnings_yield"] = _s(asset_result.get("owner_earnings_yield"))
+                df_valid.at[idx, "oe_depreciation"] = _s(oe_raw.get("depreciation"))
+                df_valid.at[idx, "oe_capex"] = _s(oe_raw.get("capex"))
+                df_valid.at[idx, "oe_depreciation_is_fallback"] = _s(oe_raw.get("depreciation_is_fallback"))
+                df_valid.at[idx, "oe_capex_is_fallback"] = _s(oe_raw.get("capex_is_fallback"))
+
+                # ── オーナーズ・アーニングス基準DCF ──
+                # OE per share = 株価 × (OE利回り/100)。
+                # 成長率はEPSトレンド由来のdcf_raw_rateをそのまま流用する。
+                oe_dcf_str = ""
+                oe_yield_val = asset_result.get("owner_earnings_yield")
+                try:
+                    price_f = float(price) if price is not None else None
+                    if price_f is not None and price_f != price_f:  # NaNチェック
+                        price_f = None
+                except (TypeError, ValueError):
+                    price_f = None
+                try:
+                    growth_rate = float(row.get("dcf_raw_rate"))
+                    if growth_rate != growth_rate:  # NaNチェック（float('nan')は例外を出さないため）
+                        growth_rate = None
+                except (TypeError, ValueError):
+                    growth_rate = None
+                if (oe_yield_val is not None and oe_yield_val == oe_yield_val
+                        and price_f is not None and growth_rate is not None):
+                    oe_per_share = price_f * (oe_yield_val / 100)
+                    oe_dcf = calc_oe_dcf(oe_per_share, growth_rate)
+                    if oe_dcf:
+                        df_valid.at[idx, "oe_per_share"] = _s(round(oe_per_share, 2))
+                        df_valid.at[idx, "oe_dcf_intrinsic"] = _s(oe_dcf.get("oe_dcf_intrinsic"))
+                        df_valid.at[idx, "oe_dcf_buy_price"] = _s(oe_dcf.get("oe_dcf_buy_price"))
+                        eps_intrinsic = None
+                        try:
+                            eps_intrinsic = float(row.get("dcf_intrinsic"))
+                        except (TypeError, ValueError):
+                            pass
+                        oe_dcf_str = f" OE正味現在価値:{oe_dcf.get('oe_dcf_intrinsic'):,.0f}円"
+                        if eps_intrinsic and eps_intrinsic > 0:
+                            gap_pct = (oe_dcf.get("oe_dcf_intrinsic") / eps_intrinsic - 1) * 100
+                            df_valid.at[idx, "oe_dcf_gap_pct"] = _s(round(gap_pct, 1))
+                            if gap_pct >= 20:
+                                oe_dcf_str += f"(EPS基準比+{gap_pct:.0f}% 隠れ価値の可能性)"
+
+                    # ── EPV（オーナーズ・アーニングス基準、成長ゼロ仮定） ──
+                    epv_oe = calc_epv(oe_per_share)
+                    if epv_oe is not None:
+                        df_valid.at[idx, "epv_oe"] = _s(epv_oe)
+                        oe_dcf_str += f" EPV(OE):{epv_oe:,.0f}円"
+
                 ratio_disp = asset_result.get("undervaluation_ratio")
                 rp_str = f" 不動産含み益:{rp_data.get('unrealized_gain',0):,.0f}円" if rp_data.get("unrealized_gain") else ""
-                print(f"-> NCAV+調整後比率:{ratio_disp}{rp_str}  "
+                oe_str = f" OE利回り:{asset_result.get('owner_earnings_yield')}%" if asset_result.get("owner_earnings_yield") is not None else ""
+                print(f"-> NCAV+調整後比率:{ratio_disp}{rp_str}{oe_str}{oe_dcf_str}  "
                       f"{'★資産過小評価' if asset_result.get('is_undervalued') else ''}")
             else:
                 print("-> データ取得不可")
