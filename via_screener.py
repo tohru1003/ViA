@@ -2130,6 +2130,72 @@ def make_html(df_all, total_input, generated, moat_db=None):
         else:
             asset_cell = '<td class="n">—</td>'
 
+        # ── 有価証券評価差額金セル ──
+        try:
+            vd_disp = float(vd)
+            if vd_disp != vd_disp:
+                vd_disp = None
+        except Exception:
+            vd_disp = None
+        vd_cell = (f'<td class="num">{vd_disp:,.0f}円</td>' if vd_disp is not None
+                   else '<td class="n">—</td>')
+
+        # ── 賃貸不動産含み益セル ──
+        rp_book = row.get("rental_property_book_value")
+        rp_fair = row.get("rental_property_fair_value")
+        try:
+            rp_disp = float(rp_gain)
+            if rp_disp != rp_disp:
+                rp_disp = None
+        except Exception:
+            rp_disp = None
+        if rp_disp:
+            rp_tip_parts = [f"賃貸不動産含み益:{rp_disp:,.0f}円"]
+            try:
+                rp_tip_parts.append(f"簿価:{float(rp_book):,.0f}円")
+            except Exception:
+                pass
+            try:
+                rp_tip_parts.append(f"時価:{float(rp_fair):,.0f}円")
+            except Exception:
+                pass
+            rp_cell = (f'<td class="uv-yes" title="{" | ".join(rp_tip_parts)}">'
+                       f'{rp_disp:,.0f}円</td>')
+        else:
+            rp_cell = '<td class="n">—</td>'
+
+        # ── 在庫リスクセル ──
+        inv_gap = row.get("inventory_growth_gap_pct")
+        is_inv_risk = str(row.get("is_inventory_risk", "")).strip().lower() == "true"
+        try:
+            inv_gap_f = float(inv_gap)
+            if inv_gap_f != inv_gap_f:
+                inv_gap_f = None
+        except Exception:
+            inv_gap_f = None
+        if inv_gap_f is not None:
+            inv_tip = "在庫の増加ペースが売上の増加ペースを上回っている（滞留在庫の懸念）" if is_inv_risk else "在庫の増加ペースは売上の増加ペース以内"
+            inv_cell = (f'<td class="{"uv-no" if is_inv_risk else ""}" title="{inv_tip}">'
+                        f'{inv_gap_f:+.1f}pt{" ⚠" if is_inv_risk else ""}</td>')
+        else:
+            inv_cell = '<td class="n">—</td>'
+
+        # ── 退職給付リスクセル ──
+        ret_diff = row.get("retirement_unrealized_diff")
+        is_ret_risk = str(row.get("is_retirement_risk", "")).strip().lower() == "true"
+        try:
+            ret_diff_f = float(ret_diff)
+            if ret_diff_f != ret_diff_f:
+                ret_diff_f = None
+        except Exception:
+            ret_diff_f = None
+        if ret_diff_f is not None and ret_diff_f != 0:
+            ret_tip = "未認識の数理計算上の差異が純資産対比で大きい（将来の費用計上リスク）" if is_ret_risk else "退職給付債務の未認識差異"
+            ret_cell = (f'<td class="{"uv-no" if is_ret_risk else ""}" title="{ret_tip}">'
+                        f'{ret_diff_f:,.0f}円{" ⚠" if is_ret_risk else ""}</td>')
+        else:
+            ret_cell = '<td class="n">—</td>'
+
         # ── オーナーズ・アーニングス利回りセル ──
         oe_yield = row.get("owner_earnings_yield")
         oe_val   = row.get("owner_earnings")
@@ -2197,10 +2263,6 @@ def make_html(df_all, total_input, generated, moat_db=None):
             f'<td class="num">{(str(bp) + " ✓") if bp else ("— " + str(row.get("dcf_skip_reason",""))[:20] if row.get("dcf_skip_reason") else "—")}</td>'
             f'<td class="num">{itr or "—"}</td>'
             f'{uv_cell}'
-            f'{peg_cell}'
-            f'{epv_cell}'
-            f'{asset_cell}'
-            f'{oe_cell}'
             f'{_moat_cell(moat_info)}'
             f'<td class="gr" data-rate="{row.get("dcf_raw_rate") or 0}">{row.get("dcf_raw_rate","")}</td>'
             f'<td class="num">{row.get("latest_EPS","")}</td>'
@@ -2208,6 +2270,14 @@ def make_html(df_all, total_input, generated, moat_db=None):
             f'<td class="num">{row.get("latest_ROA","")}</td>'
             f'<td class="num">{row.get("latest_ROIC","")}</td>'
             f'<td class="num">{row.get("latest_DE","")}</td>'
+            f'{asset_cell}'
+            f'{vd_cell}'
+            f'{rp_cell}'
+            f'{inv_cell}'
+            f'{ret_cell}'
+            f'{peg_cell}'
+            f'{epv_cell}'
+            f'{oe_cell}'
             f'{cells}'
             f'</tr>'
         )
@@ -2295,17 +2365,21 @@ td.uv-no{{color:#993C1D;font-size:11px}}
   <th onclick="sortTable(7)">購買ターゲット価格</th>
   <th onclick="sortTable(8)">正味現在価値</th>
   <th onclick="sortTable(9)">割安判定</th>
-  <th onclick="sortTable(10)">PEG</th>
-  <th onclick="sortTable(11)">EPV倍率</th>
-  <th onclick="sortTable(12)">資産過小評価</th>
-  <th onclick="sortTable(13)">OE利回り</th>
-  <th onclick="sortTable(14)">モート</th>
-  <th onclick="sortTable(15)">成長率%</th>
-  <th onclick="sortTable(15)">EPS</th>
-  <th onclick="sortTable(16)">ROE%</th>
-  <th onclick="sortTable(17)">ROA%</th>
-  <th onclick="sortTable(18)">ROIC%</th>
-  <th onclick="sortTable(19)">D/E%</th>
+  <th onclick="sortTable(10)">モート</th>
+  <th onclick="sortTable(11)">成長率%</th>
+  <th onclick="sortTable(11)">EPS</th>
+  <th onclick="sortTable(12)">ROE%</th>
+  <th onclick="sortTable(13)">ROA%</th>
+  <th onclick="sortTable(14)">ROIC%</th>
+  <th onclick="sortTable(15)">D/E%</th>
+  <th onclick="sortTable(16)">資産価値評価</th>
+  <th onclick="sortTable(17)">有価証券評価差額金</th>
+  <th onclick="sortTable(18)">賃貸不動産含み益</th>
+  <th onclick="sortTable(19)">在庫リスク</th>
+  <th onclick="sortTable(20)">退職給付リスク</th>
+  <th onclick="sortTable(21)">PEG</th>
+  <th onclick="sortTable(22)">EPV倍率</th>
+  <th onclick="sortTable(23)">OE利回り</th>
   {th}
 </tr></thead>
 <tbody>{"".join(rows)}</tbody>
