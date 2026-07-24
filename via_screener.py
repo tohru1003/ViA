@@ -2270,14 +2270,14 @@ def make_html(df_all, total_input, generated, moat_db=None):
             f'<td class="num">{row.get("latest_ROA","")}</td>'
             f'<td class="num">{row.get("latest_ROIC","")}</td>'
             f'<td class="num">{row.get("latest_DE","")}</td>'
+            f'{peg_cell}'
+            f'{epv_cell}'
+            f'{oe_cell}'
             f'{asset_cell}'
             f'{vd_cell}'
             f'{rp_cell}'
             f'{inv_cell}'
             f'{ret_cell}'
-            f'{peg_cell}'
-            f'{epv_cell}'
-            f'{oe_cell}'
             f'{cells}'
             f'</tr>'
         )
@@ -2367,19 +2367,19 @@ td.uv-no{{color:#993C1D;font-size:11px}}
   <th onclick="sortTable(9)">割安判定</th>
   <th onclick="sortTable(10)">モート</th>
   <th onclick="sortTable(11)">成長率%</th>
-  <th onclick="sortTable(11)">EPS</th>
-  <th onclick="sortTable(12)">ROE%</th>
-  <th onclick="sortTable(13)">ROA%</th>
-  <th onclick="sortTable(14)">ROIC%</th>
-  <th onclick="sortTable(15)">D/E%</th>
-  <th onclick="sortTable(16)">資産価値評価</th>
-  <th onclick="sortTable(17)">有価証券評価差額金</th>
-  <th onclick="sortTable(18)">賃貸不動産含み益</th>
-  <th onclick="sortTable(19)">在庫リスク</th>
-  <th onclick="sortTable(20)">退職給付リスク</th>
-  <th onclick="sortTable(21)">PEG</th>
-  <th onclick="sortTable(22)">EPV倍率</th>
-  <th onclick="sortTable(23)">OE利回り</th>
+  <th onclick="sortTable(12)">EPS</th>
+  <th onclick="sortTable(13)">ROE%</th>
+  <th onclick="sortTable(14)">ROA%</th>
+  <th onclick="sortTable(15)">ROIC%</th>
+  <th onclick="sortTable(16)">D/E%</th>
+  <th onclick="sortTable(17)">PEG</th>
+  <th onclick="sortTable(18)">EPV倍率</th>
+  <th onclick="sortTable(19)">OE利回り</th>
+  <th onclick="sortTable(20)">資産価値評価</th>
+  <th onclick="sortTable(21)">有価証券評価差額金</th>
+  <th onclick="sortTable(22)">賃貸不動産含み益</th>
+  <th onclick="sortTable(23)">在庫リスク</th>
+  <th onclick="sortTable(24)">退職給付リスク</th>
   {th}
 </tr></thead>
 <tbody>{"".join(rows)}</tbody>
