@@ -1536,6 +1536,11 @@ def process_ticker(ticker, market):
                 price = None
                 try: price = round(tk.fast_info.last_price, 2)
                 except: pass
+
+                # 上場廃止チェック: 株価が取得できない場合はスキップ
+                if price is None or price <= 0:
+                    return None
+
                 name, sector = ticker, ""
                 try:
                     fi_name = getattr(tk.fast_info, "name", None)
@@ -1668,6 +1673,10 @@ def process_ticker(ticker, market):
                     sector = getattr(tk.fast_info, "sector", None) or tk.info.get("sector","")
                 except: pass
 
+                # 上場廃止チェック: 株価が取得できない場合はスキップ
+                if price is None or price <= 0:
+                    return None
+
                 s_res, s_pass, s_total, s_gm = run_criteria(
                     eps, gm_arr, ocf, fcf, roe_arr, roa_arr, de_arr, roic_arr, STRICT)
                 r_res, r_pass, r_total, r_gm = run_criteria(
@@ -1765,6 +1774,11 @@ def process_ticker(ticker, market):
         price = None
         try: price = round(tk.fast_info.last_price, 2)
         except: pass
+
+        # 上場廃止チェック: 株価が取得できない場合はスキップ
+        if price is None or price <= 0:
+            return None
+
         name, sector = ticker, ""
         try:
             # fast_info.name を最初に試み、なければ info['longName'] を使う
