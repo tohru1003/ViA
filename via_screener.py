@@ -98,6 +98,120 @@ def _http_get(url, timeout=30):
         return r.read()
 
 
+# ── 上場廃止銘柄リスト取得 ─────────────────────────────────
+_DELISTED_JP_CACHE = None
+_DELISTED_US_CACHE = None
+_DELISTED_JP_CACHE_FILE = os.path.join(SCRIPT_DIR, "via_cache", "delisted_jp.json")
+_DELISTED_US_CACHE_FILE = os.path.join(SCRIPT_DIR, "via_cache", "delisted_us.json")
+
+def get_delisted_jp_tickers():
+    """JPX公式サイトから上場廃止銘柄リストを取得（キャッシュ7日）"""
+    global _DELISTED_JP_CACHE
+    if _DELISTED_JP_CACHE is not None:
+        return _DELISTED_JP_CACHE
+
+    # キャッシュファイル確認（7日以内なら使用）
+    if os.path.exists(_DELISTED_JP_CACHE_FILE):
+        try:
+            age_days = (time.time() - os.path.getmtime(_DELISTED_JP_CACHE_FILE)) / 86400
+            if age_days < 7:
+                import json
+                with open(_DELISTED_JP_CACHE_FILE, "r", encoding="utf-8") as f:
+                    _DELISTED_JP_CACHE = set(json.load(f))
+                print(f"  上場廃止リスト(JP): {len(_DELISTED_JP_CACHE)}銘柄（キャッシュ {age_days:.1f}日前）")
+                return _DELISTED_JP_CACHE
+        except Exception:
+            pass
+
+    # JPXサイトからスクレイピング
+    print("  上場廃止銘柄リスト(JP)を取得中...")
+    JPX_DELISTED_URL = "https://www.jpx.co.jp/listing/stocks/delisted/index.html"
+    delisted = set()
+
+    try:
+        html = _http_get(JPX_DELISTED_URL, timeout=30).decode("utf-8", errors="ignore")
+        import re
+        rows = re.findall(r'<tr[^>]*>.*?</tr>', html, re.DOTALL)
+        for row in rows:
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
+            for cell in cells:
+                cell_text = re.sub(r'<[^>]+>', '', cell).strip()
+                if re.match(r'^\d{4,5}$', cell_text):
+                    delisted.add(cell_text)
+
+        if delisted:
+            print(f"  → 上場廃止銘柄(JP): {len(delisted)}銘柄を取得")
+            os.makedirs(os.path.dirname(_DELISTED_JP_CACHE_FILE), exist_ok=True)
+            import json
+            with open(_DELISTED_JP_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(list(delisted), f)
+        else:
+            print("  → 上場廃止銘柄(JP)の取得に失敗（HTMLパースエラー）")
+
+    except Exception as e:
+        print(f"  → 上場廃止リスト(JP)取得エラー: {e}")
+
+    _DELISTED_JP_CACHE = delisted
+    return _DELISTED_JP_CACHE
+
+
+def get_delisted_us_tickers():
+    """EODHD APIから米国上場廃止銘柄リストを取得（キャッシュ7日）"""
+    global _DELISTED_US_CACHE
+    if _DELISTED_US_CACHE is not None:
+        return _DELISTED_US_CACHE
+
+    # キャッシュファイル確認（7日以内なら使用）
+    if os.path.exists(_DELISTED_US_CACHE_FILE):
+        try:
+            age_days = (time.time() - os.path.getmtime(_DELISTED_US_CACHE_FILE)) / 86400
+            if age_days < 7:
+                import json
+                with open(_DELISTED_US_CACHE_FILE, "r", encoding="utf-8") as f:
+                    _DELISTED_US_CACHE = set(json.load(f))
+                print(f"  上場廃止リスト(US): {len(_DELISTED_US_CACHE)}銘柄（キャッシュ {age_days:.1f}日前）")
+                return _DELISTED_US_CACHE
+        except Exception:
+            pass
+
+    # EODHD APIから取得
+    print("  上場廃止銘柄リスト(US)を取得中...")
+    delisted = set()
+
+    if not EODHD_TOKEN:
+        print("  → EODHD_TOKENが未設定のためスキップ")
+        _DELISTED_US_CACHE = delisted
+        return _DELISTED_US_CACHE
+
+    try:
+        url = f"{EODHD_BASE}/exchange-symbol-list/US?delisted=1&api_token={EODHD_TOKEN}&fmt=json"
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            import json
+            data = json.loads(r.read().decode("utf-8"))
+
+        # ティッカーシンボルを抽出
+        for item in data:
+            code = item.get("Code", "")
+            if code:
+                delisted.add(code)
+
+        if delisted:
+            print(f"  → 上場廃止銘柄(US): {len(delisted)}銘柄を取得")
+            os.makedirs(os.path.dirname(_DELISTED_US_CACHE_FILE), exist_ok=True)
+            with open(_DELISTED_US_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(list(delisted), f)
+        else:
+            print("  → 上場廃止銘柄(US)の取得に失敗")
+
+    except Exception as e:
+        print(f"  → 上場廃止リスト(US)取得エラー: {e}")
+
+    _DELISTED_US_CACHE = delisted
+    return _DELISTED_US_CACHE
+
+
 def load_jp_tickers():
     """東証全銘柄を自動ダウンロード。失敗時は日経225。"""
 
@@ -1115,6 +1229,24 @@ def get_tickers():
     us = list(dict.fromkeys(us))
     jp = list(dict.fromkeys(jp))
 
+    # 上場廃止銘柄を除外（日本株）
+    delisted_jp = get_delisted_jp_tickers()
+    if delisted_jp:
+        jp_before = len(jp)
+        jp = [t for t in jp if t.replace(".T", "") not in delisted_jp]
+        excluded_jp = jp_before - len(jp)
+        if excluded_jp > 0:
+            print(f"  → 上場廃止銘柄を除外(JP): {excluded_jp}銘柄")
+
+    # 上場廃止銘柄を除外（米国株）
+    delisted_us = get_delisted_us_tickers()
+    if delisted_us:
+        us_before = len(us)
+        us = [t for t in us if t not in delisted_us]
+        excluded_us = us_before - len(us)
+        if excluded_us > 0:
+            print(f"  → 上場廃止銘柄を除外(US): {excluded_us}銘柄")
+
     print()
     print("-" * 40)
     print(f"  取得完了: US {len(us)} 銘柄 + JP {len(jp)} 銘柄 = {len(us)+len(jp)} 銘柄")
@@ -1537,10 +1669,6 @@ def process_ticker(ticker, market):
                 try: price = round(tk.fast_info.last_price, 2)
                 except: pass
 
-                # 上場廃止チェック: 株価が取得できない場合はスキップ
-                if price is None or price <= 0:
-                    return None
-
                 name, sector = ticker, ""
                 try:
                     fi_name = getattr(tk.fast_info, "name", None)
@@ -1673,10 +1801,6 @@ def process_ticker(ticker, market):
                     sector = getattr(tk.fast_info, "sector", None) or tk.info.get("sector","")
                 except: pass
 
-                # 上場廃止チェック: 株価が取得できない場合はスキップ
-                if price is None or price <= 0:
-                    return None
-
                 s_res, s_pass, s_total, s_gm = run_criteria(
                     eps, gm_arr, ocf, fcf, roe_arr, roa_arr, de_arr, roic_arr, STRICT)
                 r_res, r_pass, r_total, r_gm = run_criteria(
@@ -1774,10 +1898,6 @@ def process_ticker(ticker, market):
         price = None
         try: price = round(tk.fast_info.last_price, 2)
         except: pass
-
-        # 上場廃止チェック: 株価が取得できない場合はスキップ
-        if price is None or price <= 0:
-            return None
 
         name, sector = ticker, ""
         try:
