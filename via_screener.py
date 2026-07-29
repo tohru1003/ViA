@@ -104,6 +104,71 @@ _DELISTED_US_CACHE = None
 _DELISTED_JP_CACHE_FILE = os.path.join(SCRIPT_DIR, "via_cache", "delisted_jp.json")
 _DELISTED_US_CACHE_FILE = os.path.join(SCRIPT_DIR, "via_cache", "delisted_us.json")
 
+JPX_DELISTED_URL = "https://www.jpx.co.jp/listing/stocks/delisted/index.html"
+
+
+def _scrape_jpx_delisted_codes(verbose=True):
+    """
+    JPX上場廃止銘柄一覧から銘柄コードを取得する。
+
+    indexページは当年分のみを掲載しているため、「バックナンバー」の
+    年度別アーカイブ（archives-01.html 〜、過去11年分）も辿って集約する。
+    戻り値: (codes:set, pages:list) pagesは実際に取得できたURL一覧
+    """
+    import re
+    from urllib.parse import urljoin, urlparse
+
+    def scrape(html):
+        found = set()
+        for row in re.findall(r'<tr[^>]*>.*?</tr>', html, re.DOTALL):
+            for cell in re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL):
+                text = re.sub(r'<[^>]+>', '', cell).strip()
+                # 4桁数字（従来）/ 5桁数字 / 数字+英数字3桁（2024年以降の新形式: 202Aなど）
+                if re.fullmatch(r'\d{4,5}|\d[0-9A-Za-z]{3}', text):
+                    found.add(text.upper())
+        return found
+
+    codes, pages = set(), []
+
+    index_html = _http_get(JPX_DELISTED_URL, timeout=30).decode("utf-8", errors="ignore")
+    codes |= scrape(index_html)
+    pages.append(JPX_DELISTED_URL)
+    if verbose:
+        print(f"    {JPX_DELISTED_URL} -> {len(codes)}件")
+
+    # バックナンバーのリンクを抽出。相対パスで書かれているため urljoin で解決する
+    archives = []
+    for href in re.findall(r'href="([^"]+)"', index_html):
+        url = urljoin(JPX_DELISTED_URL, href)
+        path = urlparse(url).path
+        if not path.startswith("/listing/stocks/delisted/") or not path.endswith(".html"):
+            continue
+        if path.endswith("/index.html"):
+            continue
+        if url not in archives:
+            archives.append(url)
+
+    # リンク抽出に失敗した場合は既知の命名規則で補完（archives-01 = 前年）
+    if not archives:
+        archives = [urljoin(JPX_DELISTED_URL, f"archives-{i:02d}.html")
+                    for i in range(1, 11)]
+
+    for url in archives:
+        try:
+            page = _http_get(url, timeout=30).decode("utf-8", errors="ignore")
+            got = scrape(page)
+            codes |= got
+            pages.append(url)
+            if verbose:
+                print(f"    {url} -> {len(got)}件")
+        except Exception as e:
+            if verbose:
+                print(f"    {url} -> 取得失敗: {e}")
+        time.sleep(0.3)
+
+    return codes, pages
+
+
 def get_delisted_jp_tickers():
     """JPX公式サイトから上場廃止銘柄リストを取得（キャッシュ7日）"""
     global _DELISTED_JP_CACHE
@@ -123,31 +188,18 @@ def get_delisted_jp_tickers():
         except Exception:
             pass
 
-    # JPXサイトからスクレイピング
     print("  上場廃止銘柄リスト(JP)を取得中...")
-    JPX_DELISTED_URL = "https://www.jpx.co.jp/listing/stocks/delisted/index.html"
     delisted = set()
-
     try:
-        html = _http_get(JPX_DELISTED_URL, timeout=30).decode("utf-8", errors="ignore")
-        import re
-        rows = re.findall(r'<tr[^>]*>.*?</tr>', html, re.DOTALL)
-        for row in rows:
-            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
-            for cell in cells:
-                cell_text = re.sub(r'<[^>]+>', '', cell).strip()
-                if re.match(r'^\d{4,5}$', cell_text):
-                    delisted.add(cell_text)
-
+        delisted, pages = _scrape_jpx_delisted_codes(verbose=False)
         if delisted:
-            print(f"  → 上場廃止銘柄(JP): {len(delisted)}銘柄を取得")
+            print(f"  → 上場廃止銘柄(JP): {len(delisted)}銘柄を取得（{len(pages)}ページ）")
             os.makedirs(os.path.dirname(_DELISTED_JP_CACHE_FILE), exist_ok=True)
             import json
             with open(_DELISTED_JP_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(list(delisted), f)
+                json.dump(sorted(delisted), f)
         else:
             print("  → 上場廃止銘柄(JP)の取得に失敗（HTMLパースエラー）")
-
     except Exception as e:
         print(f"  → 上場廃止リスト(JP)取得エラー: {e}")
 
@@ -156,7 +208,7 @@ def get_delisted_jp_tickers():
 
 
 def get_delisted_us_tickers():
-    """EODHD APIから米国上場廃止銘柄リストを取得（キャッシュ7日）"""
+    """EODHD APIから米国上場廃止銘柄リストを取得（直近2年のみ、キャッシュ7日）"""
     global _DELISTED_US_CACHE
     if _DELISTED_US_CACHE is not None:
         return _DELISTED_US_CACHE
@@ -191,25 +243,35 @@ def get_delisted_us_tickers():
             import json
             data = json.loads(r.read().decode("utf-8"))
 
-        # ティッカーシンボルを抽出
+        # 直近2年以内に上場廃止された銘柄のみ抽出
+        # （ティッカー再利用による誤フィルタを防止）
+        from datetime import datetime, timedelta
+        cutoff_date = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+
         for item in data:
             code = item.get("Code", "")
-            if code:
+            delisting_date = item.get("Delisted_Date") or item.get("DelistingDate") or ""
+            if code and delisting_date >= cutoff_date:
                 delisted.add(code)
 
         if delisted:
-            print(f"  → 上場廃止銘柄(US): {len(delisted)}銘柄を取得")
+            print(f"  → 上場廃止銘柄(US): {len(delisted)}銘柄を取得（直近2年）")
             os.makedirs(os.path.dirname(_DELISTED_US_CACHE_FILE), exist_ok=True)
             with open(_DELISTED_US_CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(list(delisted), f)
         else:
-            print("  → 上場廃止銘柄(US)の取得に失敗")
+            print("  → 直近2年の上場廃止銘柄(US)なし")
 
     except Exception as e:
         print(f"  → 上場廃止リスト(US)取得エラー: {e}")
 
     _DELISTED_US_CACHE = delisted
     return _DELISTED_US_CACHE
+
+
+# JPX公式の上場銘柄一覧から得られたTicker。この一覧は「現在上場中」の
+# 定義そのものなので、上場廃止履歴より優先される（後述の廃止フィルタ参照）。
+JP_LISTED_AUTHORITATIVE = set()
 
 
 def load_jp_tickers():
@@ -224,6 +286,7 @@ def load_jp_tickers():
             print(f"  JPXファイル検出: {manual} ({age_h:.1f}h前)")
             result = _parse_jpx(manual)
             if result:
+                JP_LISTED_AUTHORITATIVE.update(result)
                 # 地方取引所独自銘柄を追加
                 regional = _regional_exchanges()
                 # 重複除去（東証リストにない銘柄のみ追加）
@@ -294,6 +357,7 @@ def load_jp_tickers():
                 f.write(data)
             result = _parse_jpx(save)
             if result:
+                JP_LISTED_AUTHORITATIVE.update(result)
                 print(f"  → 東証: {len(result)} 銘柄")
                 return result
             else:
@@ -348,13 +412,38 @@ def _parse_jpx(path):
             print(f"  コード列が見つかりません。列名を確認してください: {list(df.columns)}")
             return []
 
+        # ── 市場・商品区分で内国株式のみに絞る ──
+        # ETF・ETN と PRO Market はJ-Quantsから財務データが一切返らず
+        # （実測 0/3）、スクリーニングの対象になり得ない。
+        # REIT・外国株式・出資証券は財務データが返る銘柄もあるが、
+        # 分配前提の収益構造や外国会社報告書ベースの開示のため、
+        # 普通株と同じ判定基準では扱えない。
+        mkt_col = None
+        for col in df.columns:
+            if "市場" in str(col):
+                mkt_col = col
+                break
+
+        if mkt_col is not None:
+            before = len(df)
+            df = df[df[mkt_col].astype(str).str.contains("内国株式", na=False)]
+            print(f"  市場区分で絞込: {before}行 → {len(df)}行（内国株式のみ）")
+        else:
+            # 列構成が変わった場合に universe を空にしてしまわないよう、
+            # 絞り込みは諦めて全件を通す
+            print("  市場区分の列が見つかりません。区分による絞込みを省略します。")
+
         codes = df[code_col].dropna().astype(str).str.strip()
-        # 4桁または5桁の数字コードを抽出（東証は4桁、一部5桁あり）
+        # 東証の銘柄コードは4桁の数字が基本。一部に5桁があり、
+        # 2024年以降の新規採番は末尾が英字（例: 417A）になる。
         codes_4 = codes[codes.str.match(r'^\d{4}$')]
         codes_5 = codes[codes.str.match(r'^\d{5}$')]
-        print(f"  4桁コード: {len(codes_4)}件  5桁コード: {len(codes_5)}件")
+        codes_alnum = codes[codes.str.match(r'^\d{3,4}[A-Za-z]$')]
+        print(f"  4桁コード: {len(codes_4)}件  5桁コード: {len(codes_5)}件  "
+              f"英字入りコード: {len(codes_alnum)}件")
 
-        all_codes = pd.concat([codes_4, codes_5]).drop_duplicates().tolist()
+        all_codes = (pd.concat([codes_4, codes_5, codes_alnum])
+                     .drop_duplicates().tolist())
         if len(all_codes) < 10:
             print(f"  コード数が少なすぎます({len(all_codes)}件)。列「{code_col}」のサンプル: {codes.head(5).tolist()}")
             return []
@@ -378,21 +467,21 @@ def _nk225():
         "4307","4324","4452","4502","4503","4506","4507","4519","4523","4528",
         "4543","4568","4578","4631","4689","4704","4751","4755","4901","4902",
         "4911","5001","5019","5020","5101","5108","5110","5201","5202","5214",
-        "5233","5301","5332","5333","5334","5401","5406","5411","5412","5413",
+        "5233","5301","5332","5333","5334","5401","5406","5411","5412",
         "5444","5463","5471","5631","5706","5707","5711","5713","5714","5715",
         "5801","5802","5803","5901","6103","6113","6178","6301","6302","6305",
         "6326","6361","6367","6471","6472","6473","6479","6501","6503","6504",
         "6506","6526","6594","6645","6674","6701","6702","6703","6724","6752",
         "6753","6758","6762","6770","6841","6857","6861","6902","6952","6954",
         "6971","6976","6981","6988","7003","7004","7011","7012","7013","7186",
-        "7201","7202","7203","7205","7211","7261","7267","7269","7270","7272",
+        "7201","7202","7203","7211","7261","7267","7269","7270","7272",
         "7731","7733","7735","7741","7751","7752","7762","7832","7911","7912",
         "7951","8001","8002","8003","8015","8031","8035","8053","8058","8113",
-        "8233","8252","8267","8306","8308","8309","8316","8331","8354","8355",
+        "8233","8252","8267","8306","8308","8309","8316","8331","8354",
         "8411","8601","8604","8630","8697","8725","8729","8750","8766","8795",
         "8801","8802","8804","8830","9001","9005","9007","9008","9009","9020",
         "9021","9022","9064","9101","9104","9107","9202","9301","9432","9433",
-        "9434","9501","9502","9503","9531","9532","9602","9613","9735","9766",
+        "9434","9501","9502","9503","9531","9532","9602","9735","9766",
     ]
     print(f"  → 日経225: {len(codes)} 銘柄（フォールバック）")
     return [c + ".T" for c in codes]
@@ -400,21 +489,21 @@ def _nk225():
 def _regional_exchanges():
     """名古屋・福岡・札幌 独自上場銘柄（東証非重複）"""
     nagoya = [
-        "2743","3543","3918","4119","5816","5917","6161","6247","6378",
-        "6387","6463","6551","6839","7220","7256","7264","7315","7322",
+        "3543","3918","4119","5816","5917","6161","6247","6378",
+        "6387","6463","6551","7220","7256","7264","7322",
         "7363","7427","7528","7599","7643","7841","8119","8142","8217",
-        "8244","8245","8279","8281","9260","9273","9322","9324","9325",
+        "8244","8281","9273","9322","9324","9325",
     ]
     fukuoka = [
         "2764","3077","3134","3172","3354","3371","3395","3443","3521",
         "3565","3607","3662","3693","4025","4082","4556","4571","5943",
-        "6040","6250","6381","6556","7060","7092","7177","7683","8087",
-        "8574","9028","9380","9381","9384","9386","9389","9423","9514",
+        "6040","6250","6381","7060","7177","7683",
+        "8574","9028","9380","9381","9389","9423","9514",
         "9540","9553","9616","9628","9663","9678","9686","9699","9715",
     ]
     sapporo = [
-        "2764","3093","3135","3548","4764","6072","6999","7821","8093",
-        "8740","9070","9279","9446","9467","9535","9633","9658",
+        "2764","3093","3135","3548","6072","6999","7821","8093",
+        "9279","9446","9467","9535","9633","9658",
     ]
     codes = list(set(nagoya + fukuoka + sapporo))
     tickers = [c + ".T" for c in codes]
@@ -1217,6 +1306,33 @@ def calc_asset_undervaluation(ticker, market, market_cap, net_income=None):
         return None
 
 
+def filter_delisted_jp(jp):
+    """
+    日本株リストから上場廃止銘柄を除外する。
+
+    廃止リストは過去9年分を含むため、持株会社化や再上場で同じコードが
+    再利用された銘柄（例: 8729 ソニーフィナンシャルグループ）も混ざる。
+    JPX公式の上場銘柄一覧に載っているコードは現在上場中であることが確定なので、
+    フィルタはその一覧に含まれないTicker（地方取引所や日経225の
+    ハードコード分）にのみ適用する。
+
+    ※米国株はティッカー再利用が頻繁で、かつアクティブリスト自体が
+      現在上場中の銘柄のみを含むため、同様のフィルタは行わない。
+    """
+    delisted_jp = get_delisted_jp_tickers()
+    if not delisted_jp:
+        return jp
+
+    before = len(jp)
+    kept = [t for t in jp
+            if t in JP_LISTED_AUTHORITATIVE
+            or t.replace(".T", "") not in delisted_jp]
+    excluded = before - len(kept)
+    if excluded > 0:
+        print(f"  → 上場廃止銘柄を除外(JP): {excluded}銘柄")
+    return kept
+
+
 def get_tickers():
     """銘柄リストを全て取得してから返す"""
     print("[銘柄リスト取得]")
@@ -1229,23 +1345,7 @@ def get_tickers():
     us = list(dict.fromkeys(us))
     jp = list(dict.fromkeys(jp))
 
-    # 上場廃止銘柄を除外（日本株）
-    delisted_jp = get_delisted_jp_tickers()
-    if delisted_jp:
-        jp_before = len(jp)
-        jp = [t for t in jp if t.replace(".T", "") not in delisted_jp]
-        excluded_jp = jp_before - len(jp)
-        if excluded_jp > 0:
-            print(f"  → 上場廃止銘柄を除外(JP): {excluded_jp}銘柄")
-
-    # 上場廃止銘柄を除外（米国株）
-    delisted_us = get_delisted_us_tickers()
-    if delisted_us:
-        us_before = len(us)
-        us = [t for t in us if t not in delisted_us]
-        excluded_us = us_before - len(us)
-        if excluded_us > 0:
-            print(f"  → 上場廃止銘柄を除外(US): {excluded_us}銘柄")
+    jp = filter_delisted_jp(jp)
 
     print()
     print("-" * 40)
