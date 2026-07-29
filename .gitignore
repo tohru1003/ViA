@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 財務データのキャッシュ（APIから再取得できる）
+via_cache/
+us_tickers_cache.txt
+
+# EDINETからダウンロードしたXBRLの展開先
+edinet_temp/
+
+# JPXの上場銘柄一覧。実行時にダウンロードされ、手動配置分も上書きされる
+jpx_tickers.xls
+jpx_tickers.xlsx
+
+# 実行ログ
+*.log
+
+# 調査・検証スクリプトの出力（再実行すれば再生成される）
+verify_result.json
+new_codes_result.json
+data_availability_result.json
+regional_delisted_report.json
+
+# アラートの実行時状態
+via_alert_state.json
+
+# エディタ・ツールのローカル設定
+.claude/settings.local.json
+.vscode/
