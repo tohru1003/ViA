@@ -512,10 +512,19 @@ def _regional_exchanges():
 
 
 
-def load_us_tickers():
-    """NYSE+NASDAQ全銘柄をGitHubから取得。失敗時はS&P500。"""
+# 米国の主要取引所。PINK/OTC は対象外（データ品質が低く、
+# スクリーニングの判定基準に耐えない銘柄が多い）。
+US_MAJOR_EXCHANGES = {"NYSE", "NASDAQ", "AMEX", "NYSE MKT", "BATS"}
 
-    # ── キャッシュ確認 ──
+
+def load_us_tickers():
+    """
+    EODHDから米国のCommon Stockのみを取得。失敗時はS&P500。
+
+    以前はGitHubの全ティッカーリストを使っていたが、FUND/ETF/ワラントが
+    混ざり、しかも粗利データ欠落によりGM判定がスコアから除外されるため
+    ファンドが事業会社より通過しやすい偏りがあった。
+    """
     cache = os.path.join(SCRIPT_DIR, "us_tickers_cache.txt")
     if os.path.exists(cache):
         age_h = (time.time() - os.path.getmtime(cache)) / 3600
@@ -525,20 +534,37 @@ def load_us_tickers():
             print(f"  US キャッシュ使用: {len(t)} 銘柄 ({age_h:.1f}h前)")
             return t
 
-    # ── GitHubからダウンロード ──
-    url = ("https://raw.githubusercontent.com/"
-           "rreichel3/US-Stock-Symbols/main/all/all_tickers.txt")
+    if not EODHD_TOKEN:
+        print("  EODHD_TOKEN未設定 → S&P500にフォールバック")
+        return _sp500()
+
     try:
-        print("  NYSE+NASDAQ全銘柄をダウンロード中...")
-        data = _http_get(url, timeout=20)
-        raw  = [l.strip() for l in data.decode().strip().split('\n') if l.strip()]
-        t    = [x for x in raw if x.isalpha() and 1 <= len(x) <= 5]
-        print(f"  → NYSE+NASDAQ: {len(t)} 銘柄")
+        print("  EODHDから米国Common Stockを取得中...")
+        data = _eodhd_fetch("exchange-symbol-list/US", "type=common_stock")
+        if not isinstance(data, list) or not data:
+            raise ValueError(f"unexpected response: {type(data)}")
+
+        tickers = []
+        for row in data:
+            code = (row.get("Code") or "").strip()
+            exch = (row.get("Exchange") or "").strip()
+            if not code or exch not in US_MAJOR_EXCHANGES:
+                continue
+            # 優先株・ワラント等のサフィックスを除外（Typeフィルタの取りこぼし対策）
+            if any(ch in code for ch in ("^", "/", " ")):
+                continue
+            tickers.append(code)
+
+        tickers = list(dict.fromkeys(tickers))
+        if len(tickers) < 100:
+            raise ValueError(f"取得件数が少なすぎます: {len(tickers)}")
+
+        print(f"  → US Common Stock（主要取引所）: {len(tickers)} 銘柄")
         with open(cache, "w") as f:
-            f.write("\n".join(t))
-        return t
+            f.write("\n".join(tickers))
+        return tickers
     except Exception as e:
-        print(f"  GitHubダウンロード失敗: {e} → S&P500にフォールバック")
+        print(f"  EODHD取得失敗: {e} → S&P500にフォールバック")
         return _sp500()
 
 
@@ -902,6 +928,44 @@ def _has_recent_jquants_earnings(code4, days=90):
         return False  # エラー時は再取得しない
 
 
+def _repair_us_roic(data):
+    """
+    旧キャッシュで ROIC が空の場合、Equity + Debt から再計算する。
+
+    以前は EODHD に無い investedCapital フィールドを参照していたため、
+    キャッシュ済みのほぼ全銘柄で roic が空配列/Noneだらけになっていた。
+    API再取得なしで直せるようにする。
+    """
+    if not isinstance(data, dict):
+        return data
+    roic = data.get("roic") or []
+    if any(v is not None for v in roic):
+        return data
+
+    ni = data.get("ni") or []
+    eq = data.get("eq") or []
+    td = data.get("td") or []
+    n = min(len(ni), len(eq))
+    if n == 0:
+        return data
+
+    new_ic, new_roic = [], []
+    for i in range(n):
+        if ni[i] is None or eq[i] is None:
+            new_ic.append(None)
+            new_roic.append(None)
+            continue
+        debt = td[i] if i < len(td) and td[i] is not None else 0.0
+        ic = eq[i] + abs(debt)
+        new_ic.append(ic)
+        new_roic.append(round(ni[i] / ic * 100, 2) if ic else None)
+
+    data = dict(data)
+    data["ic"] = new_ic
+    data["roic"] = new_roic
+    return data
+
+
 def get_us_financials(ticker, force_refresh=False):
     """
     EODHD から米国株の財務データを取得。
@@ -919,6 +983,7 @@ def get_us_financials(ticker, force_refresh=False):
     # ── ファイルキャッシュ確認 ──
     cached, is_fresh = _load_cache(code, "eodhd")
     if is_fresh and cached and not force_refresh:
+        cached = _repair_us_roic(cached)
         _eodhd_cache[code] = cached
         return cached
 
@@ -927,7 +992,8 @@ def get_us_financials(ticker, force_refresh=False):
     if cached and not force_refresh:
         # キャッシュあり（期限切れ）→ 直近に決算発表があった場合のみ再取得
         if not _has_recent_earnings(ticker_us, days=90):
-            # 決算発表なし → 古いキャッシュをそのまま使用
+            # 決算発表なし → 古いキャッシュを修理して使用
+            cached = _repair_us_roic(cached)
             _eodhd_cache[code] = cached
             return cached
 
@@ -984,10 +1050,28 @@ def get_us_financials(ticker, force_refresh=False):
 
         eq_l  = [to_f(bs[y].get("totalStockholderEquity")) for y in bs_years]
         ta_l  = [to_f(bs[y].get("totalAssets"))            for y in bs_years]
-        td_l  = [to_f(bs[y].get("shortLongTermDebt")
-                       or bs[y].get("longTermDebt"))        for y in bs_years]
-        ic_l  = [to_f(bs[y].get("investedCapital")
-                       or bs[y].get("totalCapitalization")) for y in bs_years]
+        # 総有利子負債。shortLongTermDebt は「長期負債の1年以内返済分」なので使わない。
+        td_l  = [
+            to_f(bs[y].get("shortLongTermDebtTotal")
+                 or bs[y].get("longTermDebtTotal")
+                 or bs[y].get("longTermDebt"))
+            for y in bs_years
+        ]
+        # Invested Capital。EODHDのBalance Sheetには investedCapital が無いことが
+        # 多く、従来は ic が全滅して ROIC 判定がほぼ全銘柄 False になっていた。
+        # netInvestedCapital があればそれを使い、無ければ Equity + Total Debt。
+        ic_l = []
+        for i, y in enumerate(bs_years):
+            nic = to_f(bs[y].get("netInvestedCapital"))
+            if nic is not None and nic > 0:
+                ic_l.append(nic)
+                continue
+            eq = eq_l[i] if i < len(eq_l) else None
+            if eq is None:
+                ic_l.append(None)
+                continue
+            debt = td_l[i] if i < len(td_l) and td_l[i] is not None else 0.0
+            ic_l.append(eq + abs(debt))
 
         # ── キャッシュフロー ──
         cf = _eodhd_fetch(f"fundamentals/{ticker_us}",
